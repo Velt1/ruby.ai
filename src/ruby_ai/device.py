@@ -15,6 +15,7 @@ class DeviceInfo:
     backend: str
     name: str
     default_fp16: bool
+    total_memory_bytes: int | None = None
 
 
 def _mps_is_available() -> bool:
@@ -31,11 +32,13 @@ def select_device(requested: str = "auto") -> DeviceInfo:
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA device requested, but torch.cuda.is_available() is False")
         idx = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(idx)
         return DeviceInfo(
             device=torch.device("cuda", idx),
             backend="cuda",
             name=torch.cuda.get_device_name(idx),
             default_fp16=True,
+            total_memory_bytes=int(props.total_memory),
         )
 
     if requested == "mps" or (requested == "auto" and _mps_is_available()):
@@ -55,6 +58,31 @@ def select_device(requested: str = "auto") -> DeviceInfo:
         name="CPU",
         default_fp16=False,
     )
+
+
+def resolve_auto_tile_size(
+    device_info: DeviceInfo,
+    width: int,
+    height: int,
+    *,
+    batch_size: int = 1,
+    dtype: torch.dtype = torch.float16,
+) -> int:
+    """Choose full-frame (0) or a safe tile size based on available VRAM and frame batch."""
+    if device_info.backend == "cuda" and device_info.total_memory_bytes is not None:
+        vram_gib = device_info.total_memory_bytes / (1024**3)
+        pixels = max(1, width) * max(1, height) * max(1, batch_size)
+        dtype_factor = 1.0 if dtype in (torch.float16, torch.bfloat16) else 2.0
+        effective_pixels = pixels * dtype_factor
+        if vram_gib >= 10.0 and effective_pixels <= 4_500_000:
+            return 0
+        if vram_gib >= 6.0 and effective_pixels <= 2_600_000:
+            return 0
+        if vram_gib >= 6.0:
+            return 768
+        return 512
+
+    return 512
 
 
 def resolve_dtype(device_info: DeviceInfo, fp16: bool | None) -> torch.dtype:

@@ -14,3 +14,9 @@ outputs/
 *.mov
 *.mkv
 *.webm
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/target/
+desktop/src-tauri/resources/engine/
+desktop/src-tauri/gen/
+*.key

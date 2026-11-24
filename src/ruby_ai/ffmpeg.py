@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import json
+import platform
 import shutil
 import subprocess
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
-from ruby_ai.config import EnhanceConfig
+from ruby_ai.config import EXPORT_TARGETS, EnhanceConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,6 +34,15 @@ class VideoInfo:
     has_audio: bool
     pix_fmt: str
     codec_name: str
+    color_space: str = "unknown"
+    color_transfer: str = "unknown"
+    color_primaries: str = "unknown"
+    color_range: str = "unknown"
+
+    @property
+    def is_hdr(self) -> bool:
+        """Return True if the video uses HDR PQ or HLG transfer characteristics."""
+        return self.color_transfer in {"smpte2084", "arib-std-b67"}
 
 
 def require_binary(name: str) -> str:
@@ -84,8 +95,7 @@ def _parse_fps(stream: dict[str, Any]) -> tuple[int, int, str]:
     return 30, 1, "30/1"
 
 
-def probe_video(path: Path) -> VideoInfo:
-    """Inspect a video file using ffprobe."""
+def _ffprobe_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(f"Input video not found: {path}")
 
@@ -107,8 +117,12 @@ def probe_video(path: Path) -> VideoInfo:
     )
     if proc.returncode != 0:
         raise RuntimeError(f"ffprobe failed for '{path}': {proc.stderr.strip()}")
+    return json.loads(proc.stdout)
 
-    payload = json.loads(proc.stdout)
+
+def probe_video(path: Path) -> VideoInfo:
+    """Inspect a video file using ffprobe."""
+    payload = _ffprobe_json(path)
     streams = payload.get("streams", [])
     video_stream = next((s for s in streams if s.get("codec_type") == "video"), None)
     if video_stream is None:
@@ -147,7 +161,25 @@ def probe_video(path: Path) -> VideoInfo:
         has_audio=has_audio,
         pix_fmt=str(video_stream.get("pix_fmt", "unknown")),
         codec_name=str(video_stream.get("codec_name", "unknown")),
+        color_space=str(video_stream.get("color_space", "unknown")),
+        color_transfer=str(video_stream.get("color_transfer", "unknown")),
+        color_primaries=str(video_stream.get("color_primaries", "unknown")),
+        color_range=str(video_stream.get("color_range", "unknown")),
     )
+
+
+def probe_bitrate_kbps(path: Path) -> tuple[float, float]:
+    """Return (total_bitrate_kbps, video_bitrate_kbps) using ffprobe."""
+    payload = _ffprobe_json(path)
+    raw_fmt = payload.get("format", {}).get("bit_rate")
+    total_kbps = float(raw_fmt) / 1000.0 if raw_fmt and str(raw_fmt).isdigit() else 0.0
+    video_stream = next(
+        (s for s in payload.get("streams", []) if s.get("codec_type") == "video"),
+        None,
+    )
+    raw_vid = video_stream.get("bit_rate") if video_stream else None
+    video_kbps = float(raw_vid) / 1000.0 if raw_vid and str(raw_vid).isdigit() else 0.0
+    return total_kbps, video_kbps
 
 
 def build_decode_filter(
@@ -156,9 +188,19 @@ def build_decode_filter(
     target_h: int,
     src_w: int,
     src_h: int,
+    *,
+    is_hdr: bool = False,
+    color_transfer: str = "unknown",
 ) -> str:
-    """Build FFmpeg filtergraph for temporal pre-denoising, supersampling, and rgb24 output."""
+    """Build FFmpeg filtergraph for optional HDR->SDR, temporal denoise, supersampling, rgb24."""
     filters: list[str] = []
+    if config.hdr_to_sdr and is_hdr:
+        tin = "arib-std-b67" if color_transfer == "arib-std-b67" else "smpte2084"
+        filters.append(
+            f"zscale=pin=bt2020:min=bt2020nc:tin={tin}:t=linear:npl=100,"
+            "format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
+            "zscale=t=bt709:m=bt709:r=tv"
+        )
     if config.temporal_denoise > 0.0:
         a = config.temporal_denoise
         b = min(a * 2.0, 0.5)
@@ -172,12 +214,21 @@ def build_decode_filter(
 
 
 def build_encode_filter(config: EnhanceConfig) -> str:
-    """Build FFmpeg filtergraph for adaptive sharpening, BT.709 YUV420p conversion, and grain."""
-    filters: list[str] = []
+    """Build FFmpeg filtergraph for BT.709 YUV420p, deband, luma CAS, clarity, and grain."""
+    filters: list[str] = [
+        "scale=out_color_matrix=bt709:out_range=tv",
+        "format=yuv420p",
+    ]
+    if config.deband:
+        filters.append("deband=1thr=0.02:2thr=0.02:3thr=0.02:blur=1")
     if config.sharpen > 0.0:
-        filters.append(f"cas=strength={config.sharpen:.3f}")
-    filters.append("scale=out_color_matrix=bt709:out_range=tv")
-    filters.append("format=yuv420p")
+        filters.append(f"cas=strength={config.sharpen:.3f}:planes=1")
+    if config.clarity > 0.0:
+        la = 0.10 + config.clarity * 0.65
+        contrast = 1.0 + config.clarity * 0.12
+        saturation = 1.0 + config.clarity * 0.12
+        filters.append(f"unsharp=lx=13:ly=13:la={la:.3f}:cx=3:cy=3:ca=0.0")
+        filters.append(f"eq=contrast={contrast:.3f}:saturation={saturation:.3f}")
     if config.grain > 0:
         filters.append(f"noise=c0s={config.grain}:c0f=t+u")
     return ",".join(filters)
@@ -226,41 +277,231 @@ class ManagedProcess:
         self._stderr_thread.join(timeout=1.0)
 
 
-def _codec_args(config: EnhanceConfig) -> list[str]:
-    if config.codec == "libx264":
-        return [
-            "-c:v",
-            "libx264",
-            "-preset",
-            config.x264_preset,
-            "-crf",
-            str(config.crf),
-            "-profile:v",
-            "high",
-        ]
-    if config.codec == "h264_nvenc":
-        return [
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            "p5",
-            "-rc",
-            "vbr",
-            "-cq",
-            str(config.crf),
-            "-profile:v",
-            "high",
-        ]
-    if config.codec == "h264_videotoolbox":
-        return [
-            "-c:v",
-            "h264_videotoolbox",
-            "-q:v",
-            "65",
-            "-profile:v",
-            "high",
-        ]
-    raise ValueError(f"Unsupported codec '{config.codec}'")
+def resolve_h264_level(target_w: int, target_h: int, fps: float) -> str:
+    """Select an H.264 level compatible with target dimensions and framerate."""
+    if max(target_w, target_h) > 2048:
+        return "5.1"
+    if fps > 35.0:
+        return "4.2"
+    return "4.1"
+
+
+def resolve_maxrate_kbps(config: EnhanceConfig, fps: float) -> int | None:
+    """Resolve VBV peak bitrate cap in kbps from explicit override or export target."""
+    if config.maxrate_kbps is not None:
+        return config.maxrate_kbps
+    target = EXPORT_TARGETS.get(config.export_target)
+    if target is None:
+        return None
+    key = "maxrate_kbps_60fps" if fps > 35.0 else "maxrate_kbps_30fps"
+    raw = target.get(key)
+    return int(raw) if raw is not None else None
+
+
+def resolve_gop_frames(config: EnhanceConfig, fps: float) -> int | None:
+    """Compute GOP length in frames for social-ingest friendly keyframe intervals."""
+    if config.gop_seconds <= 0.0:
+        return None
+    return max(12, round(max(1.0, fps) * config.gop_seconds))
+
+
+def _build_libx264_args(
+    config: EnhanceConfig,
+    *,
+    target_w: int,
+    target_h: int,
+    fps: float,
+) -> list[str]:
+    args = [
+        "-c:v",
+        "libx264",
+        "-preset",
+        config.x264_preset,
+        "-crf",
+        str(config.crf),
+        "-profile:v",
+        "high",
+        "-level:v",
+        resolve_h264_level(target_w, target_h, fps),
+    ]
+    gop = resolve_gop_frames(config, fps)
+    if gop is not None:
+        args.extend(["-g", str(gop), "-flags", "+cgop"])
+    maxrate = resolve_maxrate_kbps(config, fps)
+    if maxrate is not None:
+        args.extend(["-maxrate", f"{maxrate}k", "-bufsize", f"{maxrate * 2}k"])
+    return args
+
+
+def _build_nvenc_args(
+    config: EnhanceConfig,
+    *,
+    target_w: int,
+    target_h: int,
+    fps: float,
+) -> list[str]:
+    args = [
+        "-c:v",
+        "h264_nvenc",
+        "-preset",
+        config.nvenc_preset,
+        "-tune",
+        "hq",
+        "-rc",
+        "vbr",
+        "-cq",
+        str(config.crf),
+        "-b:v",
+        "0",
+        "-multipass",
+        "fullres",
+        "-spatial-aq",
+        "1",
+        "-temporal-aq",
+        "1",
+        "-rc-lookahead",
+        "20",
+        "-profile:v",
+        "high",
+        "-level:v",
+        resolve_h264_level(target_w, target_h, fps),
+    ]
+    gop = resolve_gop_frames(config, fps)
+    if gop is not None:
+        args.extend(["-g", str(gop)])
+    maxrate = resolve_maxrate_kbps(config, fps)
+    if maxrate is not None:
+        args.extend(["-maxrate", f"{maxrate}k", "-bufsize", f"{maxrate * 2}k"])
+    return args
+
+
+def _build_videotoolbox_args(
+    config: EnhanceConfig,
+    *,
+    target_w: int,
+    target_h: int,
+    fps: float,
+) -> list[str]:
+    args = [
+        "-c:v",
+        "h264_videotoolbox",
+        "-q:v",
+        "65",
+        "-profile:v",
+        "high",
+        "-level:v",
+        resolve_h264_level(target_w, target_h, fps),
+    ]
+    gop = resolve_gop_frames(config, fps)
+    if gop is not None:
+        args.extend(["-g", str(gop)])
+    maxrate = resolve_maxrate_kbps(config, fps)
+    if maxrate is not None:
+        args.extend(["-maxrate", f"{maxrate}k", "-bufsize", f"{maxrate * 2}k"])
+    return args
+
+
+EncoderArgBuilder = Callable[..., list[str]]
+
+ENCODER_BUILDERS: dict[str, EncoderArgBuilder] = {
+    "libx264": _build_libx264_args,
+    "h264_nvenc": _build_nvenc_args,
+    "h264_videotoolbox": _build_videotoolbox_args,
+}
+
+
+def resolve_codec(requested_codec: str, *, device_backend: str | None = None) -> str:
+    """Resolve explicit or 'auto' H.264 encoder based on hardware and FFmpeg support."""
+    if requested_codec != "auto":
+        if requested_codec not in ENCODER_BUILDERS:
+            raise ValueError(f"Unsupported codec '{requested_codec}'")
+        return requested_codec
+
+    encoders = available_h264_encoders()
+    cuda_active = device_backend == "cuda"
+    if device_backend is None and "h264_nvenc" in encoders:
+        try:
+            import torch
+
+            cuda_active = bool(torch.cuda.is_available())
+        except Exception:
+            cuda_active = False
+
+    if cuda_active and "h264_nvenc" in encoders:
+        return "h264_nvenc"
+    if platform.system() == "Darwin" and "h264_videotoolbox" in encoders:
+        return "h264_videotoolbox"
+    return "libx264"
+
+
+def resolve_hwaccel(requested: str, *, device_backend: str | None = None) -> str | None:
+    """Resolve optional FFmpeg decode hwaccel ('none', 'auto', or 'cuda')."""
+    if requested == "none":
+        return None
+    if requested == "cuda":
+        return "cuda"
+    if requested == "auto":
+        if device_backend == "cuda":
+            return "cuda"
+        if device_backend is None:
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    return "cuda"
+            except Exception:
+                return None
+    return None
+
+
+def _codec_args(
+    config: EnhanceConfig,
+    *,
+    resolved_codec: str | None = None,
+    target_w: int = 1080,
+    target_h: int = 1920,
+    fps: float = 30.0,
+) -> list[str]:
+    codec = resolved_codec or config.codec
+    builder = ENCODER_BUILDERS.get(codec)
+    if builder is None:
+        raise ValueError(f"Unsupported codec '{codec}'")
+    return builder(config, target_w=target_w, target_h=target_h, fps=fps)
+
+
+def build_decode_command(
+    info: VideoInfo,
+    config: EnhanceConfig,
+    target_w: int,
+    target_h: int,
+    *,
+    start_sec: float | None = None,
+    duration_sec: float | None = None,
+    hwaccel: str | None = None,
+    ffmpeg_bin: str | None = None,
+) -> list[str]:
+    """Construct the FFmpeg command arguments used for video decoding."""
+    binary = ffmpeg_bin or require_binary("ffmpeg")
+    vf = build_decode_filter(
+        config,
+        target_w,
+        target_h,
+        info.display_width,
+        info.display_height,
+        is_hdr=info.is_hdr,
+        color_transfer=info.color_transfer,
+    )
+    args = [binary, "-hide_banner", "-loglevel", "error"]
+    resolved_hw = hwaccel if hwaccel is not None else resolve_hwaccel(config.hwaccel)
+    if resolved_hw:
+        args.extend(["-hwaccel", resolved_hw])
+    if start_sec is not None:
+        args.extend(["-ss", f"{start_sec:.3f}"])
+    args.extend(["-i", str(info.path)])
+    if duration_sec is not None:
+        args.extend(["-t", f"{duration_sec:.3f}"])
+    args.extend(["-an", "-sn", "-dn", "-vf", vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+    return args
 
 
 def open_decode_pipe(
@@ -271,27 +512,22 @@ def open_decode_pipe(
     *,
     start_sec: float | None = None,
     duration_sec: float | None = None,
+    hwaccel: str | None = None,
 ) -> ManagedProcess:
     """Open an FFmpeg process streaming decoded rgb24 frames to stdout."""
-    ffmpeg_bin = require_binary("ffmpeg")
-    vf = build_decode_filter(
+    args = build_decode_command(
+        info,
         config,
         target_w,
         target_h,
-        info.display_width,
-        info.display_height,
+        start_sec=start_sec,
+        duration_sec=duration_sec,
+        hwaccel=hwaccel,
     )
-    args = [ffmpeg_bin, "-hide_banner", "-loglevel", "error"]
-    if start_sec is not None:
-        args.extend(["-ss", f"{start_sec:.3f}"])
-    args.extend(["-i", str(info.path)])
-    if duration_sec is not None:
-        args.extend(["-t", f"{duration_sec:.3f}"])
-    args.extend(["-an", "-sn", "-dn", "-vf", vf, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
     return ManagedProcess(args, stdin_pipe=False, stdout_pipe=True)
 
 
-def open_encode_pipe(
+def build_encode_command(
     info: VideoInfo,
     output_path: Path,
     config: EnhanceConfig,
@@ -300,14 +536,16 @@ def open_encode_pipe(
     *,
     start_sec: float | None = None,
     duration_sec: float | None = None,
-) -> ManagedProcess:
-    """Open an FFmpeg process reading rgb24 frames from stdin and encoding MP4."""
-    ffmpeg_bin = require_binary("ffmpeg")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_codec: str | None = None,
+    ffmpeg_bin: str | None = None,
+) -> list[str]:
+    """Construct the FFmpeg command arguments used for social-ready MP4 encoding."""
+    binary = ffmpeg_bin or require_binary("ffmpeg")
     vf = build_encode_filter(config)
+    fps_val = info.fps_num / info.fps_den if info.fps_den else 30.0
 
     args = [
-        ffmpeg_bin,
+        binary,
         "-y",
         "-hide_banner",
         "-loglevel",
@@ -330,12 +568,36 @@ def open_encode_pipe(
         if duration_sec is not None:
             args.extend(["-t", f"{duration_sec:.3f}"])
         args.extend(["-i", str(info.path)])
-        args.extend(["-map", "0:v:0", "-map", "1:a?", "-c:a", "aac", "-b:a", "192k", "-shortest"])
+        args.extend(
+            [
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a?",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-ar",
+                str(config.audio_sample_rate),
+                "-shortest",
+            ]
+        )
     else:
         args.extend(["-map", "0:v:0", "-an"])
 
     args.extend(["-vf", vf])
-    args.extend(_codec_args(config))
+    if config.cfr:
+        args.extend(["-fps_mode", "cfr"])
+    args.extend(
+        _codec_args(
+            config,
+            resolved_codec=resolved_codec,
+            target_w=target_w,
+            target_h=target_h,
+            fps=fps_val,
+        )
+    )
     args.extend(
         [
             "-colorspace",
@@ -350,6 +612,32 @@ def open_encode_pipe(
             "+faststart",
             str(output_path),
         ]
+    )
+    return args
+
+
+def open_encode_pipe(
+    info: VideoInfo,
+    output_path: Path,
+    config: EnhanceConfig,
+    target_w: int,
+    target_h: int,
+    *,
+    start_sec: float | None = None,
+    duration_sec: float | None = None,
+    resolved_codec: str | None = None,
+) -> ManagedProcess:
+    """Open an FFmpeg process reading rgb24 frames from stdin and encoding MP4."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    args = build_encode_command(
+        info,
+        output_path,
+        config,
+        target_w,
+        target_h,
+        start_sec=start_sec,
+        duration_sec=duration_sec,
+        resolved_codec=resolved_codec,
     )
     return ManagedProcess(args, stdin_pipe=True, stdout_pipe=False)
 
@@ -369,49 +657,92 @@ def encode_baseline_lanczos(
     start_sec: float | None = None,
     duration_sec: float | None = None,
     crf: int = 16,
+    fast_preview: bool = False,
+    hdr_to_sdr: bool = False,
+    is_hdr: bool = False,
+    color_transfer: str = "unknown",
 ) -> None:
     """Encode a plain Lanczos downscaled baseline clip for A/B comparison."""
     ffmpeg_bin = require_binary("ffmpeg")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    args = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error"]
+    base_prefix = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error"]
     if start_sec is not None:
-        args.extend(["-ss", f"{start_sec:.3f}"])
-    args.extend(["-i", str(input_path)])
+        base_prefix.extend(["-ss", f"{start_sec:.3f}"])
+    base_prefix.extend(["-i", str(input_path)])
     if duration_sec is not None:
-        args.extend(["-t", f"{duration_sec:.3f}"])
-    args.extend(
-        [
-            "-vf",
-            (
-                f"scale={target_w}:{target_h}:flags=lanczos+accurate_rnd+full_chroma_int,"
-                "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p"
-            ),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "slow",
-            "-crf",
-            str(crf),
-            "-profile:v",
-            "high",
-            "-colorspace",
-            "bt709",
-            "-color_primaries",
-            "bt709",
-            "-color_trc",
-            "bt709",
-            "-color_range",
-            "tv",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-movflags",
-            "+faststart",
+        base_prefix.extend(["-t", f"{duration_sec:.3f}"])
+
+    filters: list[str] = []
+    if hdr_to_sdr and is_hdr:
+        tin = "arib-std-b67" if color_transfer == "arib-std-b67" else "smpte2084"
+        filters.append(
+            f"zscale=pin=bt2020:min=bt2020nc:tin={tin}:t=linear:npl=100,"
+            "format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
+            "zscale=t=bt709:m=bt709:r=tv"
+        )
+    filters.append(
+        f"scale={target_w}:{target_h}:flags=lanczos+accurate_rnd+full_chroma_int,"
+        "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p"
+    )
+    vf = ",".join(filters)
+
+    color_and_container = [
+        "-colorspace",
+        "bt709",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        "-color_range",
+        "tv",
+        "-movflags",
+        "+faststart",
+    ]
+
+    if fast_preview:
+        encoder_candidates: list[list[str]] = []
+        if "h264_nvenc" in available_h264_encoders():
+            encoder_candidates.append(
+                [
+                    "-c:v",
+                    "h264_nvenc",
+                    "-preset",
+                    "p4",
+                    "-rc",
+                    "vbr",
+                    "-cq",
+                    "18",
+                    "-b:v",
+                    "0",
+                    "-profile:v",
+                    "high",
+                ]
+            )
+        encoder_candidates.append(
+            ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-profile:v", "high"]
+        )
+        middle_args = ["-vf", vf, "-fps_mode", "cfr", "-g", "30", "-an"]
+    else:
+        encoder_candidates = [
+            ["-c:v", "libx264", "-preset", "slow", "-crf", str(crf), "-profile:v", "high"]
+        ]
+        middle_args = ["-vf", vf, "-c:a", "aac", "-b:a", "192k"]
+
+    for idx, encoder_args in enumerate(encoder_candidates):
+        cmd = [
+            *base_prefix,
+            *middle_args,
+            *encoder_args,
+            *color_and_container,
             str(output_path),
         ]
-    )
-    _run_ffmpeg(args, "Baseline Lanczos encode")
+        is_last = idx == len(encoder_candidates) - 1
+        try:
+            _run_ffmpeg(cmd, "Baseline Lanczos encode")
+            return
+        except Exception:
+            if is_last:
+                raise
 
 
 def simulate_social_compression(
@@ -519,7 +850,7 @@ def available_h264_encoders() -> list[str]:
     if proc.returncode != 0:
         return []
     found: list[str] = []
-    for candidate in ("libx264", "h264_nvenc", "h264_videotoolbox"):
+    for candidate in ENCODER_BUILDERS:
         if candidate in proc.stdout:
             found.append(candidate)
     return found

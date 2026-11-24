@@ -1,0 +1,88 @@
+name: Release ruby.ai Studio
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  publish-tauri:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: "--bundles nsis"
+          # Future platform support:
+          # - platform: macos-latest
+          #   args: "--bundles app,dmg"
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Enable Windows long paths
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "desktop/src-tauri -> target"
+
+      - name: Setup uv and verify Python lint
+        uses: astral-sh/setup-uv@v5
+
+      - name: Lint Python engine
+        run: uvx ruff check .
+
+      - name: Install desktop dependencies
+        run: pnpm --dir desktop install --frozen-lockfile
+
+      - name: Stage Python engine resources
+        run: pnpm --dir desktop stage:engine
+
+      - name: Typecheck frontend
+        run: pnpm --dir desktop typecheck
+
+      - name: Build and publish signed Tauri release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: desktop
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v__VERSION__' }}
+          releaseName: "ruby.ai Studio v__VERSION__"
+          releaseBody: |
+            ## ruby.ai Studio v__VERSION__
+
+            ### Erstinstallation (Windows 64-Bit)
+            1. Lade **`ruby.ai___VERSION___x64-setup.exe`** herunter und starte die Installation.
+            2. Beim ersten Start lädt **ruby.ai Studio** automatisch FFmpeg sowie die passende Python-/PyTorch-Laufzeit (CUDA für NVIDIA-GPUs oder CPU-Fallback) herunter.
+
+            ### Over-the-Air Update
+            Bestehende Installationen erkennen dieses Update beim Start automatisch über `latest.json` und aktualisieren sich signiert per Klick.
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}

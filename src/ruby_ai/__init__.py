@@ -3,7 +3,7 @@
 from ruby_ai.config import EnhanceConfig, PresetName
 from ruby_ai.pipeline import enhance_video
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "EnhanceConfig",
