@@ -28,7 +28,7 @@ export interface EngineClient {
   ensureRuntimeReady(forceReinstall?: boolean): Promise<RuntimeStatus>;
   subscribeRuntimeEvents(handler: (event: RuntimeProgressEvent) => void): Promise<UnlistenFn>;
   getEngineInfo(): Promise<EngineInfo>;
-  probeVideo(path: string, maxShortEdge?: number): Promise<VideoProbe>;
+  probeVideo(path: string, maxShortEdge?: number, model?: string): Promise<VideoProbe>;
   analyzeVideo(path: string): Promise<VideoAnalysis>;
   startJob(mode: JobMode, payload: StartJobPayload): Promise<{ job_id: string }>;
   cancelJob(jobId: string): Promise<boolean>;
@@ -61,10 +61,15 @@ export class TauriEngineClient implements EngineClient {
     return invoke<EngineInfo>("get_engine_info");
   }
 
-  async probeVideo(path: string, maxShortEdge = 1080): Promise<VideoProbe> {
+  async probeVideo(
+    path: string,
+    maxShortEdge = 1080,
+    model?: string
+  ): Promise<VideoProbe> {
     return invoke<VideoProbe>("probe_video", {
       path,
       maxShortEdge,
+      model,
     });
   }
 
@@ -104,9 +109,12 @@ export class TauriEngineClient implements EngineClient {
   }
 
   async pickOutputFile(defaultPath?: string): Promise<string | null> {
+    const isMov = defaultPath?.toLowerCase().endsWith(".mov");
     const selected = await save({
       defaultPath,
-      filters: [{ name: "MP4 Video", extensions: ["mp4"] }],
+      filters: isMov
+        ? [{ name: "ProRes MOV", extensions: ["mov"] }]
+        : [{ name: "MP4 Video", extensions: ["mp4"] }],
     });
     return selected ?? null;
   }

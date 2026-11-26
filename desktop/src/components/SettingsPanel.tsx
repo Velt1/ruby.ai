@@ -240,7 +240,7 @@ export function SettingsPanel({
 
           <Separator />
 
-          {/* 3. Human-readable 4K/Social Sliders */}
+          {/* 3. Human-readable 4K/Social & Topaz-equivalent Sliders */}
           <div className="space-y-3.5">
             <Label className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
               3. Feinjustierung
@@ -255,6 +255,26 @@ export function SettingsPanel({
               step={0.05}
               displayValue={`${Math.round(settings.ai_strength * 100)}%`}
               onChange={(v) => onUpdateSettings({ ai_strength: v })}
+            />
+            <SliderRow
+              label="Original-Details bewahren"
+              hint="Mischt feine Mikro-Texturen des Originals zurück (Recover Details)"
+              value={settings.recover_details}
+              min={0}
+              max={0.6}
+              step={0.05}
+              displayValue={`${Math.round((settings.recover_details / 0.6) * 100)}%`}
+              onChange={(v) => onUpdateSettings({ recover_details: v })}
+            />
+            <SliderRow
+              label="Temporale Stabilität (Anti-Flicker)"
+              hint="Bewegungskompensierte Glättung mit Schnitt-Erkennung"
+              value={settings.temporal_consistency}
+              min={0}
+              max={0.8}
+              step={0.05}
+              displayValue={`${Math.round((settings.temporal_consistency / 0.8) * 100)}%`}
+              onChange={(v) => onUpdateSettings({ temporal_consistency: v })}
             />
             <SliderRow
               label="Kanten-Schärfe (Luma)"
@@ -277,8 +297,8 @@ export function SettingsPanel({
               onChange={(v) => onUpdateSettings({ clarity: v })}
             />
             <SliderRow
-              label="Rauschen glätten"
-              hint="Entfernt Sensorflimmern vor der Kompression"
+              label="Rauschen glätten (Pre-Denoise)"
+              hint="Entfernt Sensorflimmern vor dem KI-Modell"
               value={settings.temporal_denoise}
               min={0}
               max={0.25}
@@ -286,6 +306,19 @@ export function SettingsPanel({
               displayValue={`${Math.round((settings.temporal_denoise / 0.25) * 100)}%`}
               onChange={(v) => onUpdateSettings({ temporal_denoise: v })}
             />
+
+            <div className="flex items-center justify-between pt-1">
+              <div>
+                <Label className="text-xs">Farbtreue (WaveletFix / keepColor)</Label>
+                <p className="text-[10px] text-muted-foreground">
+                  Verhindert KI-Farbstiche und Helligkeitsdrift
+                </p>
+              </div>
+              <Switch
+                checked={settings.keep_color}
+                onCheckedChange={(checked) => onUpdateSettings({ keep_color: checked })}
+              />
+            </div>
 
             <div className="flex items-center justify-between pt-1">
               <div>
@@ -329,7 +362,7 @@ export function SettingsPanel({
             <CollapsibleContent className="space-y-3.5 pt-3">
               <div className="space-y-1.5">
                 <Label className="text-[11px] text-muted-foreground">
-                  Direkte 1×-Modellwahl
+                  Direkte Modellwahl (1× & 2×)
                 </Label>
                 <Select
                   value={settings.model}
@@ -341,11 +374,57 @@ export function SettingsPanel({
                   <SelectContent>
                     {(engineInfo?.models ?? []).map((m) => (
                       <SelectItem key={m.key} value={m.key}>
-                        {m.key} · {m.architecture} ({m.license})
+                        {m.scale}× · {m.key} · {m.architecture} ({m.license})
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
+              </div>
+
+              <SliderRow
+                label="Dehalo (Ringing-Schutz)"
+                hint="Dämpft weiße/dunkle Überschwinger an harten Kanten"
+                value={settings.dehalo}
+                min={0}
+                max={0.8}
+                step={0.05}
+                displayValue={`${Math.round((settings.dehalo / 0.8) * 100)}%`}
+                onChange={(v) => onUpdateSettings({ dehalo: v })}
+              />
+
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-1">
+                  <Label className="text-[11px] text-muted-foreground">Kachel-Blending</Label>
+                  <Select
+                    value={settings.tile_blending}
+                    onValueChange={(v) => onUpdateSettings({ tile_blending: v })}
+                  >
+                    <SelectTrigger className="h-8">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="gaussian">2D-Gauß (Topaz)</SelectItem>
+                      <SelectItem value="cosine">Cosinus</SelectItem>
+                      <SelectItem value="linear">Linear</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="space-y-1">
+                  <Label className="text-[11px] text-muted-foreground">Pipeline-Bittiefe</Label>
+                  <Select
+                    value={String(settings.pipe_bit_depth)}
+                    onValueChange={(v) => onUpdateSettings({ pipe_bit_depth: Number(v) })}
+                  >
+                    <SelectTrigger className="h-8">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="16">16-Bit (rgb48le)</SelectItem>
+                      <SelectItem value="8">8-Bit (rgb24)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
               </div>
 
               <div className="grid grid-cols-2 gap-2">
@@ -486,6 +565,17 @@ export function SettingsPanel({
                 onChange={(v) => onUpdateSettings({ grain: v })}
               />
 
+              <SliderRow
+                label="Scene-Cut-Schwelle"
+                hint="Verhindert Geisterbilder bei harten Schnitten"
+                value={settings.scene_change_threshold}
+                min={0.05}
+                max={0.5}
+                step={0.01}
+                displayValue={`${settings.scene_change_threshold.toFixed(2)}`}
+                onChange={(v) => onUpdateSettings({ scene_change_threshold: v })}
+              />
+
               <div className="grid grid-cols-2 gap-2">
                 <div className="space-y-1">
                   <Label className="text-[11px] text-muted-foreground">Encoder</Label>
@@ -497,13 +587,20 @@ export function SettingsPanel({
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      {(engineInfo?.options.codecs ?? ["auto", "libx264", "h264_nvenc"]).map(
-                        (c) => (
-                          <SelectItem key={c} value={c}>
-                            {c}
-                          </SelectItem>
-                        )
-                      )}
+                      {(
+                        engineInfo?.options.codecs ?? [
+                          "auto",
+                          "libx264",
+                          "h264_nvenc",
+                          "hevc_nvenc",
+                          "libx265",
+                          "prores_ks",
+                        ]
+                      ).map((c) => (
+                        <SelectItem key={c} value={c}>
+                          {c}
+                        </SelectItem>
+                      ))}
                     </SelectContent>
                   </Select>
                 </div>
@@ -545,6 +642,7 @@ export function SettingsPanel({
                       <SelectItem value="0">Full-Frame</SelectItem>
                       <SelectItem value="768">768px</SelectItem>
                       <SelectItem value="512">512px</SelectItem>
+                      <SelectItem value="384">384px</SelectItem>
                     </SelectContent>
                   </Select>
                 </div>
@@ -597,7 +695,7 @@ export function SettingsPanel({
                   />
                 </div>
                 <div className="flex items-center justify-between">
-                  <Label className="text-xs">GPU-Optimierungen (FastGN + NHWC)</Label>
+                  <Label className="text-xs">GPU-Optimierungen (FastGN + NHWC + TF32)</Label>
                   <Switch
                     checked={settings.optimize_gpu}
                     onCheckedChange={(checked) =>

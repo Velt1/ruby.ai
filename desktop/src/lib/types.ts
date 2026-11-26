@@ -5,6 +5,7 @@ export interface DeviceInfoPayload {
   name: string;
   default_fp16: boolean;
   total_memory_gb: number | null;
+  free_memory_gb?: number | null;
   error?: string | null;
 }
 
@@ -13,10 +14,15 @@ export interface PresetSpec {
   model: string;
   temporal_denoise: number;
   ai_strength: number;
+  keep_color?: boolean;
+  recover_details?: number;
+  dehalo?: number;
+  temporal_consistency?: number;
   sharpen: number;
   clarity: number;
   deband: boolean;
   grain: number;
+  pipe_bit_depth?: number;
 }
 
 export interface ProfileSpec {
@@ -58,6 +64,8 @@ export interface EngineOptions {
   nvenc_presets: string[];
   hwaccels: string[];
   export_targets: string[];
+  tile_blendings?: string[];
+  pipe_bit_depths?: number[];
 }
 
 export interface EngineInfo {
@@ -69,11 +77,16 @@ export interface EngineInfo {
   device: DeviceInfoPayload;
   cuda_available: boolean;
   mps_available: boolean;
+  nvidia_gpu_hardware?: string | null;
+  nvidia_driver_version?: string | null;
+  cuda_warning?: string | null;
   ffmpeg_available: boolean;
   ffprobe_available: boolean;
   ffmpeg_path: string | null;
   ffprobe_path: string | null;
   encoders: string[];
+  nvenc_usable?: boolean | null;
+  nvenc_error?: string | null;
   presets: PresetSpec[];
   profiles: ProfileSpec[];
   export_targets: ExportTargetSpec[];
@@ -97,6 +110,8 @@ export interface VideoProbe {
   frame_count: number;
   has_audio: boolean;
   pix_fmt: string;
+  bit_depth?: number;
+  is_high_bit_depth?: boolean;
   codec_name: string;
   color_space?: string;
   color_transfer?: string;
@@ -114,6 +129,9 @@ export interface VideoAnalysis {
   avg_luma: number;
   avg_saturation: number;
   bits_per_pixel: number;
+  noise_score?: number;
+  sharpness_score?: number;
+  compression_score?: number;
   is_low_light: boolean;
   is_heavily_compressed: boolean;
   is_hdr: boolean;
@@ -131,11 +149,17 @@ export interface PipelineSettings {
   max_short_edge: number;
   temporal_denoise: number;
   ai_strength: number;
+  keep_color: boolean;
+  recover_details: number;
+  dehalo: number;
+  temporal_consistency: number;
+  scene_change_threshold: number;
   sharpen: number;
   clarity: number;
   deband: boolean;
   grain: number;
   hdr_to_sdr: boolean;
+  pipe_bit_depth: number;
   maxrate_kbps: number | null;
   crf: number;
   codec: string;
@@ -145,6 +169,7 @@ export interface PipelineSettings {
   tile_size: number | null;
   tile_overlap: number;
   tile_batch_size: number;
+  tile_blending: string;
   batch_size: number;
   optimize_gpu: boolean;
   compile_model: boolean;
@@ -167,6 +192,9 @@ export interface EnhanceJobResult {
   model_key: string;
   codec_used: string;
   effective_tile_size: number | null;
+  effective_tile_batch_size?: number;
+  pipe_bit_depth?: number;
+  model_scale?: number;
   batch_size: number;
   file_size_bytes: number;
   total_bitrate_kbps: number;
@@ -205,6 +233,13 @@ export type JobEvent =
       output_dir?: string;
       preset: string;
       model: string;
+    }
+  | {
+      type: "status";
+      job_id: string;
+      stage: string;
+      message: string;
+      detail?: string | null;
     }
   | {
       type: "progress";
@@ -249,6 +284,10 @@ export interface JobRecord {
   fps: number;
   elapsed_sec: number;
   eta_sec: number | null;
+  started_at_ms: number;
+  status_stage?: string;
+  status_message?: string;
+  status_detail?: string | null;
   error_message?: string;
   enhance_result?: EnhanceJobResult;
   benchmark_result?: BenchmarkJobResult;

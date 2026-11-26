@@ -102,6 +102,7 @@ async fn probe_video(
     state: State<'_, AppState>,
     path: String,
     max_short_edge: Option<u32>,
+    model: Option<String>,
 ) -> Result<Value, String> {
     let engine = state
         .engine
@@ -111,6 +112,7 @@ async fn probe_video(
     let payload = json!({
         "path": path,
         "max_short_edge": max_short_edge.unwrap_or(1080),
+        "model": model,
         "generate_poster": true
     });
     tauri::async_runtime::spawn_blocking(move || engine.run_sync_command("probe", &payload))

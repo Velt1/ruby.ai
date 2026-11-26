@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { AlertCircle } from "lucide-react";
+import { AlertCircle, AlertTriangle } from "lucide-react";
 import { HeaderBar } from "@/components/HeaderBar";
 import { JobQueueBar } from "@/components/JobQueueBar";
 import { ModelsDoctorView } from "@/components/ModelsDoctorView";
@@ -33,11 +33,17 @@ const DEFAULT_SETTINGS: PipelineSettings = {
   max_short_edge: 1080,
   temporal_denoise: 0.03,
   ai_strength: 0.7,
+  keep_color: true,
+  recover_details: 0.2,
+  dehalo: 0.15,
+  temporal_consistency: 0.25,
+  scene_change_threshold: 0.18,
   sharpen: 0.42,
   clarity: 0.22,
   deband: true,
   grain: 2,
   hdr_to_sdr: true,
+  pipe_bit_depth: 16,
   maxrate_kbps: null,
   crf: 16,
   codec: "auto",
@@ -47,6 +53,7 @@ const DEFAULT_SETTINGS: PipelineSettings = {
   tile_size: null,
   tile_overlap: 32,
   tile_batch_size: 4,
+  tile_blending: "gaussian",
   batch_size: 1,
   optimize_gpu: true,
   compile_model: false,
@@ -57,6 +64,76 @@ const DEFAULT_SETTINGS: PipelineSettings = {
   reference_path: null,
   output_path: null,
 };
+
+function applyJobEvent(job: JobRecord, ev: JobEvent): JobRecord {
+  if (ev.type === "started") {
+    return { ...job, status: "running" };
+  }
+  if (ev.type === "status") {
+    return {
+      ...job,
+      status: job.status === "cancelled" ? "cancelled" : "running",
+      status_stage: ev.stage,
+      status_message: ev.message,
+      status_detail: ev.detail ?? null,
+    };
+  }
+  if (ev.type === "progress") {
+    return {
+      ...job,
+      status: "running",
+      frames_done: ev.frames_done,
+      total_frames: ev.total_frames,
+      percent: ev.percent ?? job.percent,
+      fps: ev.fps,
+      elapsed_sec: ev.elapsed_sec,
+      eta_sec: ev.eta_sec,
+    };
+  }
+  if (ev.type === "completed") {
+    if (ev.mode === "enhance") {
+      const res = ev.result as EnhanceJobResult;
+      return {
+        ...job,
+        status: "completed",
+        percent: 100,
+        frames_done: res.frames_processed,
+        total_frames: res.frames_processed,
+        fps: res.fps,
+        elapsed_sec: res.elapsed_sec,
+        eta_sec: 0,
+        status_message: undefined,
+        status_detail: null,
+        enhance_result: res,
+      };
+    }
+    const res = ev.result as BenchmarkJobResult;
+    return {
+      ...job,
+      status: "completed",
+      percent: 100,
+      frames_done: res.enhance_result.frames_processed,
+      total_frames: res.enhance_result.frames_processed,
+      fps: res.enhance_result.fps,
+      elapsed_sec: res.enhance_result.elapsed_sec,
+      eta_sec: 0,
+      status_message: undefined,
+      status_detail: null,
+      benchmark_result: res,
+    };
+  }
+  if (ev.type === "cancelled") {
+    return { ...job, status: "cancelled" };
+  }
+  if (ev.type === "error") {
+    return {
+      ...job,
+      status: "failed",
+      error_message: ev.message,
+    };
+  }
+  return job;
+}
 
 export function App() {
   const {
@@ -90,6 +167,7 @@ export function App() {
 
   const [jobs, setJobs] = useState<JobRecord[]>([]);
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
+  const pendingEventsRef = useRef<Map<string, JobEvent[]>>(new Map());
 
   const loadEngineInfo = useCallback(async () => {
     setLoadingInfo(true);
@@ -176,7 +254,8 @@ export function App() {
       try {
         const probeResult = await engineClient.probeVideo(
           filePath,
-          settings.max_short_edge
+          settings.max_short_edge,
+          settings.model
         );
         setProbe(probeResult);
         setActiveView("studio");
@@ -196,7 +275,7 @@ export function App() {
         setAnalyzing(false);
       }
     },
-    [settings.max_short_edge]
+    [settings.max_short_edge, settings.model]
   );
 
   // Subscribe to native Tauri drag-and-drop
@@ -234,72 +313,24 @@ export function App() {
     };
   }, [handleLoadVideo]);
 
-  // Subscribe to Python NDJSON worker events from Tauri
+  // Subscribe to Python NDJSON worker events from Tauri with early-event buffering
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let mounted = true;
 
     const handleEvent = (ev: JobEvent) => {
-      if (!ev.job_id) return;
-      setJobs((prev) =>
-        prev.map((job) => {
-          if (job.job_id !== ev.job_id) return job;
-          if (ev.type === "started") {
-            return { ...job, status: "running" };
-          }
-          if (ev.type === "progress") {
-            return {
-              ...job,
-              status: "running",
-              frames_done: ev.frames_done,
-              total_frames: ev.total_frames,
-              percent: ev.percent ?? job.percent,
-              fps: ev.fps,
-              elapsed_sec: ev.elapsed_sec,
-              eta_sec: ev.eta_sec,
-            };
-          }
-          if (ev.type === "completed") {
-            if (ev.mode === "enhance") {
-              const res = ev.result as EnhanceJobResult;
-              return {
-                ...job,
-                status: "completed",
-                percent: 100,
-                frames_done: res.frames_processed,
-                total_frames: res.frames_processed,
-                fps: res.fps,
-                elapsed_sec: res.elapsed_sec,
-                eta_sec: 0,
-                enhance_result: res,
-              };
-            }
-            const res = ev.result as BenchmarkJobResult;
-            return {
-              ...job,
-              status: "completed",
-              percent: 100,
-              frames_done: res.enhance_result.frames_processed,
-              total_frames: res.enhance_result.frames_processed,
-              fps: res.enhance_result.fps,
-              elapsed_sec: res.enhance_result.elapsed_sec,
-              eta_sec: 0,
-              benchmark_result: res,
-            };
-          }
-          if (ev.type === "cancelled") {
-            return { ...job, status: "cancelled" };
-          }
-          if (ev.type === "error") {
-            return {
-              ...job,
-              status: "failed",
-              error_message: ev.message,
-            };
-          }
-          return job;
-        })
-      );
+      const jobId = ev.job_id;
+      if (!jobId) return;
+      setJobs((prev) => {
+        const idx = prev.findIndex((j) => j.job_id === jobId);
+        if (idx === -1) {
+          const buf = pendingEventsRef.current.get(jobId) ?? [];
+          buf.push(ev);
+          pendingEventsRef.current.set(jobId, buf);
+          return prev;
+        }
+        return prev.map((job) => (job.job_id === jobId ? applyJobEvent(job, ev) : job));
+      });
     };
 
     void engineClient
@@ -337,12 +368,23 @@ export function App() {
       model: found.model,
       temporal_denoise: found.temporal_denoise,
       ai_strength: found.ai_strength,
+      keep_color: found.keep_color ?? prev.keep_color,
+      recover_details: found.recover_details ?? 0.0,
+      dehalo: found.dehalo ?? 0.0,
+      temporal_consistency: found.temporal_consistency ?? 0.0,
       sharpen: found.sharpen,
       clarity: found.clarity,
       deband: found.deband,
       grain: found.grain,
+      pipe_bit_depth: found.pipe_bit_depth ?? prev.pipe_bit_depth,
       batch_size: found.key === "fast" ? 2 : 1,
     }));
+    if (probe) {
+      void engineClient
+        .probeVideo(probe.path, settings.max_short_edge, found.model)
+        .then(setProbe)
+        .catch(() => {});
+    }
   };
 
   const handleSelectExportTarget = (targetKey: string) => {
@@ -355,7 +397,7 @@ export function App() {
     }));
     if (probe) {
       void engineClient
-        .probeVideo(probe.path, target.max_short_edge)
+        .probeVideo(probe.path, target.max_short_edge, settings.model)
         .then(setProbe)
         .catch(() => {});
     }
@@ -364,28 +406,56 @@ export function App() {
   const handleApplyAutoEstimate = () => {
     if (!analysis) return;
     const ov = analysis.recommended_overrides;
+    const nextModel = typeof ov.model === "string" ? ov.model : settings.model;
     setSettings((prev) => ({
       ...prev,
       preset: analysis.recommended_preset,
       export_target: analysis.recommended_export_target,
       max_short_edge: 1080,
-      model: typeof ov.model === "string" ? ov.model : prev.model,
+      model: nextModel,
       ai_strength:
         typeof ov.ai_strength === "number" ? ov.ai_strength : prev.ai_strength,
       temporal_denoise:
         typeof ov.temporal_denoise === "number"
           ? ov.temporal_denoise
           : prev.temporal_denoise,
+      keep_color:
+        typeof ov.keep_color === "boolean" ? ov.keep_color : prev.keep_color,
+      recover_details:
+        typeof ov.recover_details === "number"
+          ? ov.recover_details
+          : prev.recover_details,
+      dehalo: typeof ov.dehalo === "number" ? ov.dehalo : prev.dehalo,
+      temporal_consistency:
+        typeof ov.temporal_consistency === "number"
+          ? ov.temporal_consistency
+          : prev.temporal_consistency,
       sharpen: typeof ov.sharpen === "number" ? ov.sharpen : prev.sharpen,
       clarity: typeof ov.clarity === "number" ? ov.clarity : prev.clarity,
       deband: typeof ov.deband === "boolean" ? ov.deband : prev.deband,
       grain: typeof ov.grain === "number" ? ov.grain : prev.grain,
+      pipe_bit_depth:
+        typeof ov.pipe_bit_depth === "number" ? ov.pipe_bit_depth : prev.pipe_bit_depth,
       batch_size: analysis.recommended_preset === "fast" ? 2 : 1,
     }));
+    if (probe) {
+      void engineClient
+        .probeVideo(probe.path, 1080, nextModel)
+        .then(setProbe)
+        .catch(() => {});
+    }
   };
 
   const handleUpdateSettings = (patch: Partial<PipelineSettings>) => {
     setSettings((prev) => ({ ...prev, ...patch }));
+    if (probe && (patch.model !== undefined || patch.max_short_edge !== undefined)) {
+      const nextEdge = patch.max_short_edge ?? settings.max_short_edge;
+      const nextModel = patch.model ?? settings.model;
+      void engineClient
+        .probeVideo(probe.path, nextEdge, nextModel)
+        .then(setProbe)
+        .catch(() => {});
+    }
   };
 
   const handlePickVideo = async () => {
@@ -396,8 +466,9 @@ export function App() {
   };
 
   const handlePickOutput = async () => {
+    const ext = settings.codec === "prores_ks" ? "mov" : "mp4";
     const defaultName = probe
-      ? `${probe.filename.replace(/\.[^.]+$/, "")}_ruby_${settings.preset}.mp4`
+      ? `${probe.filename.replace(/\.[^.]+$/, "")}_ruby_${settings.preset}.${ext}`
       : undefined;
     const file = await engineClient.pickOutputFile(defaultName);
     if (file) handleUpdateSettings({ output_path: file });
@@ -429,11 +500,17 @@ export function App() {
         max_short_edge: settings.max_short_edge,
         temporal_denoise: settings.temporal_denoise,
         ai_strength: settings.ai_strength,
+        keep_color: settings.keep_color,
+        recover_details: settings.recover_details,
+        dehalo: settings.dehalo,
+        temporal_consistency: settings.temporal_consistency,
+        scene_change_threshold: settings.scene_change_threshold,
         sharpen: settings.sharpen,
         clarity: settings.clarity,
         deband: settings.deband,
         grain: settings.grain,
         hdr_to_sdr: settings.hdr_to_sdr,
+        pipe_bit_depth: settings.pipe_bit_depth,
         maxrate_kbps: settings.maxrate_kbps,
         crf: settings.crf,
         codec: settings.codec,
@@ -443,6 +520,7 @@ export function App() {
         tile_size: settings.tile_size,
         tile_overlap: settings.tile_overlap,
         tile_batch_size: settings.tile_batch_size,
+        tile_blending: settings.tile_blending,
         batch_size: settings.batch_size,
         optimize_gpu: settings.optimize_gpu,
         compile_model: settings.compile_model,
@@ -452,7 +530,7 @@ export function App() {
 
     try {
       const { job_id } = await engineClient.startJob(mode, payload);
-      const record: JobRecord = {
+      let record: JobRecord = {
         job_id,
         mode,
         input_path: probe.path,
@@ -466,7 +544,19 @@ export function App() {
         fps: 0,
         elapsed_sec: 0,
         eta_sec: null,
+        started_at_ms: Date.now(),
+        status_message:
+          mode === "preview"
+            ? "Bereite 2s Social-Vorschau vor…"
+            : "Starte KI-Restauration…",
       };
+      const buffered = pendingEventsRef.current.get(job_id);
+      if (buffered && buffered.length > 0) {
+        pendingEventsRef.current.delete(job_id);
+        for (const ev of buffered) {
+          record = applyJobEvent(record, ev);
+        }
+      }
       setJobs((prev) => [record, ...prev]);
       setActiveJobId(job_id);
     } catch (err) {
@@ -519,6 +609,18 @@ export function App() {
                   <AlertCircle className="h-4 w-4" />
                   <AlertTitle>Python-Engine nicht erreichbar</AlertTitle>
                   <AlertDescription>{infoError}</AlertDescription>
+                </Alert>
+              </div>
+            )}
+
+            {engineInfo?.cuda_warning && (
+              <div className="px-4 pt-3">
+                <Alert variant="warning">
+                  <AlertTriangle className="h-4 w-4" />
+                  <AlertTitle>NVIDIA GPU-Beschleunigung inaktiv</AlertTitle>
+                  <AlertDescription className="text-xs">
+                    {engineInfo.cuda_warning}
+                  </AlertDescription>
                 </Alert>
               </div>
             )}

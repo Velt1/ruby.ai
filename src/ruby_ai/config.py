@@ -11,14 +11,27 @@ PresetName = Literal[
     "crisp",
     "low-light",
     "fast",
+    "upscale-2x",
     "passthrough",
 ]
 
-ALLOWED_CODECS = frozenset({"auto", "libx264", "h264_nvenc", "h264_videotoolbox"})
+ALLOWED_CODECS = frozenset(
+    {
+        "auto",
+        "libx264",
+        "h264_nvenc",
+        "h264_videotoolbox",
+        "hevc_nvenc",
+        "libx265",
+        "prores_ks",
+    }
+)
 ALLOWED_NVENC_PRESETS = frozenset({"p1", "p2", "p3", "p4", "p5", "p6", "p7"})
 ALLOWED_HWACCELS = frozenset({"none", "auto", "cuda"})
 ALLOWED_EXPORT_TARGETS = frozenset({"social-1080p", "master-4k", "custom"})
 ALLOWED_AUDIO_SAMPLE_RATES = frozenset({44100, 48000})
+ALLOWED_TILE_BLENDINGS = frozenset({"gaussian", "cosine", "linear"})
+ALLOWED_PIPE_BIT_DEPTHS = frozenset({8, 16})
 ALLOWED_X264_PRESETS = frozenset(
     {
         "ultrafast",
@@ -76,24 +89,38 @@ PRESETS: dict[PresetName, dict[str, Any]] = {
         "model": "de-h264",
         "temporal_denoise": 0.03,
         "ai_strength": 0.70,
+        "keep_color": True,
+        "recover_details": 0.20,
+        "dehalo": 0.15,
+        "temporal_consistency": 0.25,
         "sharpen": 0.42,
         "clarity": 0.22,
         "deband": True,
         "grain": 2,
+        "pipe_bit_depth": 16,
     },
     "natural": {
         "model": "de-h264",
         "temporal_denoise": 0.02,
         "ai_strength": 0.45,
+        "keep_color": True,
+        "recover_details": 0.25,
+        "dehalo": 0.10,
+        "temporal_consistency": 0.20,
         "sharpen": 0.15,
         "clarity": 0.0,
         "deband": False,
         "grain": 2,
+        "pipe_bit_depth": 16,
     },
     "crisp": {
         "model": "de-h264",
         "temporal_denoise": 0.03,
         "ai_strength": 0.65,
+        "keep_color": True,
+        "recover_details": 0.15,
+        "dehalo": 0.10,
+        "temporal_consistency": 0.20,
         "sharpen": 0.25,
         "clarity": 0.0,
         "deband": False,
@@ -103,28 +130,57 @@ PRESETS: dict[PresetName, dict[str, Any]] = {
         "model": "denoise",
         "temporal_denoise": 0.05,
         "ai_strength": 0.75,
+        "keep_color": True,
+        "recover_details": 0.15,
+        "dehalo": 0.10,
+        "temporal_consistency": 0.35,
         "sharpen": 0.30,
         "clarity": 0.15,
         "deband": True,
         "grain": 3,
+        "pipe_bit_depth": 16,
     },
     "fast": {
         "model": "superscale-span",
         "temporal_denoise": 0.02,
         "ai_strength": 0.65,
+        "keep_color": True,
+        "recover_details": 0.15,
+        "dehalo": 0.15,
+        "temporal_consistency": 0.15,
         "sharpen": 0.35,
         "clarity": 0.18,
         "deband": False,
         "grain": 2,
+        "pipe_bit_depth": 8,
+    },
+    "upscale-2x": {
+        "model": "upscale-2x-span",
+        "temporal_denoise": 0.02,
+        "ai_strength": 0.80,
+        "keep_color": True,
+        "recover_details": 0.20,
+        "dehalo": 0.15,
+        "temporal_consistency": 0.25,
+        "sharpen": 0.25,
+        "clarity": 0.12,
+        "deband": True,
+        "grain": 2,
+        "pipe_bit_depth": 16,
     },
     "passthrough": {
         "model": "de-h264",
         "temporal_denoise": 0.02,
         "ai_strength": 0.0,
+        "keep_color": False,
+        "recover_details": 0.0,
+        "dehalo": 0.0,
+        "temporal_consistency": 0.0,
         "sharpen": 0.15,
         "clarity": 0.0,
         "deband": False,
         "grain": 0,
+        "pipe_bit_depth": 8,
     },
 }
 
@@ -162,6 +218,14 @@ PROFILE_METADATA: list[dict[str, Any]] = [
         "primary": True,
     },
     {
+        "key": "upscale-2x",
+        "label": "2× AI Upscaler",
+        "badge": "2× SPAN",
+        "style": "2× Upscaling",
+        "tagline": "Skaliert 720p/1080p-Quellen per KI scharf bis auf 4K hoch (CC-BY-4.0).",
+        "primary": True,
+    },
+    {
         "key": "crisp",
         "label": "Classic Crisp",
         "badge": "CLI",
@@ -182,7 +246,7 @@ PROFILE_METADATA: list[dict[str, Any]] = [
 
 @dataclass(slots=True)
 class EnhanceConfig:
-    """Validated configuration for the 5-stage restoration pipeline."""
+    """Validated configuration for the multi-stage restoration pipeline."""
 
     model: str = "de-h264"
     device: str = "auto"
@@ -190,6 +254,11 @@ class EnhanceConfig:
     max_short_edge: int = 1080
     temporal_denoise: float = 0.03
     ai_strength: float = 0.65
+    keep_color: bool = True
+    recover_details: float = 0.0
+    dehalo: float = 0.0
+    temporal_consistency: float = 0.0
+    scene_change_threshold: float = 0.18
     sharpen: float = 0.25
     clarity: float = 0.0
     deband: bool = False
@@ -203,7 +272,9 @@ class EnhanceConfig:
     tile_size: int | None = None
     tile_overlap: int = 32
     tile_batch_size: int = 4
+    tile_blending: str = "gaussian"
     batch_size: int = 1
+    pipe_bit_depth: int = 8
     crf: int = 16
     codec: str = "libx264"
     x264_preset: str = "slow"
@@ -225,6 +296,14 @@ class EnhanceConfig:
             raise ValueError("temporal_denoise must be between 0.0 and 0.25")
         if not (0.0 <= self.ai_strength <= 1.0):
             raise ValueError("ai_strength must be between 0.0 and 1.0")
+        if not (0.0 <= self.recover_details <= 1.0):
+            raise ValueError("recover_details must be between 0.0 and 1.0")
+        if not (0.0 <= self.dehalo <= 1.0):
+            raise ValueError("dehalo must be between 0.0 and 1.0")
+        if not (0.0 <= self.temporal_consistency <= 1.0):
+            raise ValueError("temporal_consistency must be between 0.0 and 1.0")
+        if not (0.05 <= self.scene_change_threshold <= 0.80):
+            raise ValueError("scene_change_threshold must be between 0.05 and 0.80")
         if not (0.0 <= self.sharpen <= 1.0):
             raise ValueError("sharpen must be between 0.0 and 1.0")
         if not (0.0 <= self.clarity <= 1.0):
@@ -256,8 +335,18 @@ class EnhanceConfig:
                 raise ValueError("tile_overlap must be strictly smaller than tile_size")
         if not (1 <= self.tile_batch_size <= 64):
             raise ValueError("tile_batch_size must be between 1 and 64")
+        if self.tile_blending not in ALLOWED_TILE_BLENDINGS:
+            raise ValueError(
+                f"Unsupported tile_blending '{self.tile_blending}' "
+                f"(allowed: {sorted(ALLOWED_TILE_BLENDINGS)})"
+            )
         if not (1 <= self.batch_size <= 16):
             raise ValueError("batch_size must be between 1 and 16")
+        if self.pipe_bit_depth not in ALLOWED_PIPE_BIT_DEPTHS:
+            raise ValueError(
+                f"Unsupported pipe_bit_depth '{self.pipe_bit_depth}' "
+                f"(allowed: {sorted(ALLOWED_PIPE_BIT_DEPTHS)})"
+            )
         if not (0 <= self.crf <= 51):
             raise ValueError("crf must be between 0 and 51")
         if self.codec not in ALLOWED_CODECS:
@@ -299,16 +388,25 @@ def resolve_target_dimensions(
     src_width: int,
     src_height: int,
     max_short_edge: int,
+    *,
+    allow_upscale: bool = False,
+    model_scale: int = 1,
 ) -> tuple[int, int]:
-    """Compute even target dimensions capping the short edge without upscaling."""
+    """Compute even target dimensions capping at max_short_edge, upscaling only when allowed."""
     if src_width < 2 or src_height < 2:
         raise ValueError(f"Invalid source dimensions: {src_width}x{src_height}")
     if max_short_edge < 2:
         raise ValueError(f"Invalid max_short_edge: {max_short_edge}")
 
     short_edge = min(src_width, src_height)
-    if short_edge <= max_short_edge:
-        return _round_even(src_width), _round_even(src_height)
+    if not allow_upscale or model_scale <= 1:
+        if short_edge <= max_short_edge:
+            return _round_even(src_width), _round_even(src_height)
+        scale = max_short_edge / short_edge
+        return _round_even(src_width * scale), _round_even(src_height * scale)
 
-    scale = max_short_edge / short_edge
+    target_short = min(max_short_edge, short_edge * model_scale)
+    if target_short == short_edge:
+        return _round_even(src_width), _round_even(src_height)
+    scale = target_short / short_edge
     return _round_even(src_width * scale), _round_even(src_height * scale)

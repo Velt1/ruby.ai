@@ -1,6 +1,6 @@
 [package]
 name = "ruby-ai-desktop"
-version = "0.2.0"
+version = "0.3.0"
 description = "Open-source 4K-to-1080p video restoration and supersampling studio"
 authors = ["Velt1"]
 edition = "2021"

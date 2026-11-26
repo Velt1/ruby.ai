@@ -1,5 +1,6 @@
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
+  AlertTriangle,
   ArrowUpCircle,
   CheckCircle2,
   DownloadCloud,
@@ -9,6 +10,7 @@ import {
   Wrench,
   XCircle,
 } from "lucide-react";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -48,7 +50,7 @@ export function ModelsDoctorView({
   onInstallUpdate,
   onRepairRuntime,
 }: ModelsDoctorViewProps) {
-  const versionLabel = appVersion ?? engineInfo?.version ?? "0.1.0";
+  const versionLabel = appVersion ?? engineInfo?.version ?? "0.2.0";
   const updateBusy =
     updateState.phase === "checking" ||
     updateState.phase === "downloading" ||
@@ -64,7 +66,7 @@ export function ModelsDoctorView({
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-lg font-semibold tracking-tight">
-              System-Diagnose, Updates & 1×-Modell-Registry
+              System-Diagnose, Updates & Modell-Registry
             </h1>
             <p className="text-xs text-muted-foreground">
               App-Updates (OTA), verwaltete Runtime, GPU-Backend, FFmpeg-Encoder und Open-Weight-Modelle.
@@ -82,6 +84,16 @@ export function ModelsDoctorView({
             Neu prüfen
           </Button>
         </div>
+
+        {engineInfo?.cuda_warning && (
+          <Alert variant="warning">
+            <AlertTriangle className="h-4 w-4" />
+            <AlertTitle>NVIDIA GPU-Treiber prüfen</AlertTitle>
+            <AlertDescription className="text-xs">
+              {engineInfo.cuda_warning}
+            </AlertDescription>
+          </Alert>
+        )}
 
         {/* App, Runtime & OTA Updates Card */}
         <Card>
@@ -246,10 +258,19 @@ export function ModelsDoctorView({
                     <span className="text-muted-foreground">VRAM</span>
                     <span className="tabular-nums font-medium">
                       {engineInfo.device.total_memory_gb != null
-                        ? `${engineInfo.device.total_memory_gb} GiB`
+                        ? `${engineInfo.device.total_memory_gb} GiB` +
+                          (engineInfo.device.free_memory_gb != null
+                            ? ` (${engineInfo.device.free_memory_gb} GiB frei)`
+                            : "")
                         : "n/a"}
                     </span>
                   </div>
+                  {engineInfo.nvidia_driver_version && (
+                    <div className="flex justify-between">
+                      <span className="text-muted-foreground">NVIDIA Treiber</span>
+                      <span className="tabular-nums">{engineInfo.nvidia_driver_version}</span>
+                    </div>
+                  )}
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">Standard-Präzision</span>
                     <span>{engineInfo.device.default_fp16 ? "fp16" : "fp32"}</span>
@@ -284,7 +305,7 @@ export function ModelsDoctorView({
 
               <Card>
                 <CardHeader>
-                  <CardTitle>FFmpeg & H.264 Encoder</CardTitle>
+                  <CardTitle>FFmpeg & Video-Encoder</CardTitle>
                   <CardDescription>Streaming-Decode & Export</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-2 text-xs">
@@ -310,6 +331,19 @@ export function ModelsDoctorView({
                       {engineInfo.ffprobe_available ? "Erkannt" : "Fehlt"}
                     </span>
                   </div>
+                  {engineInfo.nvenc_usable !== null &&
+                    engineInfo.nvenc_usable !== undefined && (
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-muted-foreground">NVENC Test</span>
+                        <Badge
+                          variant={engineInfo.nvenc_usable ? "success" : "warning"}
+                          className="text-[10px]"
+                          title={engineInfo.nvenc_error ?? undefined}
+                        >
+                          {engineInfo.nvenc_usable ? "Verwendbar" : "Fallback auf libx264"}
+                        </Badge>
+                      </div>
+                    )}
                   <div className="pt-1">
                     <span className="text-muted-foreground block mb-1.5">Verfügbare Encoder</span>
                     <div className="flex flex-wrap gap-1.5">
@@ -327,7 +361,7 @@ export function ModelsDoctorView({
             <Card>
               <CardHeader>
                 <CardTitle>
-                  Registrierte 1×-Restaurationsmodelle ({engineInfo.models.length})
+                  Registrierte KI-Modelle ({engineInfo.models.length})
                 </CardTitle>
                 <CardDescription>
                   Sichere .safetensors-Gewichte – beim ersten Aufruf automatisch gecacht.
@@ -339,6 +373,7 @@ export function ModelsDoctorView({
                     <thead>
                       <tr className="border-b text-muted-foreground">
                         <th className="py-2 pr-3 font-medium">Key</th>
+                        <th className="py-2 pr-3 font-medium">Scale</th>
                         <th className="py-2 pr-3 font-medium">Architektur</th>
                         <th className="py-2 pr-3 font-medium">Quelle</th>
                         <th className="py-2 pr-3 font-medium">Autor</th>
@@ -352,6 +387,11 @@ export function ModelsDoctorView({
                         <tr key={m.key} className="hover:bg-accent/30">
                           <td className="py-2.5 pr-3 font-mono font-medium text-foreground">
                             {m.key}
+                          </td>
+                          <td className="py-2.5 pr-3">
+                            <Badge variant="outline" className="text-[10px]">
+                              {m.scale}×
+                            </Badge>
                           </td>
                           <td className="py-2.5 pr-3">{m.architecture}</td>
                           <td className="py-2.5 pr-3 uppercase text-muted-foreground">

@@ -15,14 +15,22 @@ from rich.table import Table
 
 from ruby_ai import __version__
 from ruby_ai.config import EXPORT_TARGETS, PRESETS, EnhanceConfig, PresetName
-from ruby_ai.device import select_device
-from ruby_ai.ffmpeg import available_h264_encoders, require_binary
+from ruby_ai.device import (
+    detect_nvidia_gpu_hardware,
+    query_cuda_memory_info,
+    select_device,
+)
+from ruby_ai.ffmpeg import (
+    available_video_encoders,
+    probe_encoder_usable,
+    require_binary,
+)
 from ruby_ai.models import MODEL_REGISTRY
 from ruby_ai.pipeline import enhance_video, run_benchmark_detailed
 
 app = typer.Typer(
     name="ruby-ai",
-    help="Open-source 4K-to-1080p video restoration and supersampling CLI for social media.",
+    help="Open-source video restoration, upscaling, and social-4K export CLI.",
     no_args_is_help=True,
 )
 console = Console()
@@ -44,7 +52,7 @@ def enhance(
     ],
     output: Annotated[
         Path | None,
-        typer.Option("--output", "-o", help="Output MP4 path (defaults next to input)."),
+        typer.Option("--output", "-o", help="Output video path (defaults next to input)."),
     ] = None,
     preset: Annotated[
         str,
@@ -81,7 +89,42 @@ def enhance(
         float | None,
         typer.Option(
             "--ai-strength",
-            help="Blend weight between supersampled frame and 1x model (0.0-1.0).",
+            help="Blend weight between reference frame and neural output (0.0-1.0).",
+        ),
+    ] = None,
+    keep_color: Annotated[
+        bool | None,
+        typer.Option(
+            "--keep-color/--no-keep-color",
+            help="Match low-frequency BT.709 color & exposure to input (WaveletFix).",
+        ),
+    ] = None,
+    recover_details: Annotated[
+        float | None,
+        typer.Option(
+            "--recover-details",
+            help="Blend cored high-frequency original detail back into luma (0.0-1.0).",
+        ),
+    ] = None,
+    dehalo: Annotated[
+        float | None,
+        typer.Option(
+            "--dehalo",
+            help="Suppress neural edge ringing overshoot (0.0-1.0).",
+        ),
+    ] = None,
+    temporal_consistency: Annotated[
+        float | None,
+        typer.Option(
+            "--temporal-consistency",
+            help="Motion-compensated temporal stabilization strength (0.0-1.0).",
+        ),
+    ] = None,
+    scene_change_threshold: Annotated[
+        float | None,
+        typer.Option(
+            "--scene-change-threshold",
+            help="Scene-cut threshold resetting temporal history (0.05-0.80).",
         ),
     ] = None,
     sharpen: Annotated[
@@ -107,6 +150,10 @@ def enhance(
         bool | None,
         typer.Option("--hdr-to-sdr/--no-hdr-to-sdr", help="Auto-tonemap HDR sources to BT.709."),
     ] = None,
+    pipe_bit_depth: Annotated[
+        int | None,
+        typer.Option("--pipe-bit-depth", help="Frame pipe bit depth: 8 (rgb24) or 16 (rgb48le)."),
+    ] = None,
     maxrate_kbps: Annotated[
         int | None,
         typer.Option("--maxrate-kbps", help="Optional VBV peak bitrate cap in kbps."),
@@ -130,6 +177,10 @@ def enhance(
         int | None,
         typer.Option("--tile-batch-size", help="Number of tiles evaluated together per GPU pass."),
     ] = None,
+    tile_blending: Annotated[
+        str | None,
+        typer.Option("--tile-blending", help="Tile overlap strategy: gaussian, cosine, or linear."),
+    ] = None,
     batch_size: Annotated[
         int | None,
         typer.Option("--batch-size", help="Number of video frames processed per GPU batch."),
@@ -142,12 +193,12 @@ def enhance(
         str | None,
         typer.Option(
             "--codec",
-            help="H.264 encoder: auto, libx264, h264_nvenc, or h264_videotoolbox.",
+            help="Encoder: auto, libx264, h264_nvenc, hevc_nvenc, libx265, prores_ks.",
         ),
     ] = None,
     x264_preset: Annotated[
         str | None,
-        typer.Option("--x264-preset", help="libx264 speed preset (e.g. medium, slow)."),
+        typer.Option("--x264-preset", help="libx264/libx265 speed preset (e.g. medium, slow)."),
     ] = None,
     nvenc_preset: Annotated[
         str | None,
@@ -161,7 +212,7 @@ def enhance(
         bool | None,
         typer.Option(
             "--optimize-gpu/--no-optimize-gpu",
-            help="Enable CUDA kernel/layout optimizations (FastGroupNorm, NHWC, cuDNN benchmark).",
+            help="Enable CUDA kernel/layout optimizations (FastGroupNorm, NHWC, TF32).",
         ),
     ] = None,
     compile_model: Annotated[
@@ -194,7 +245,7 @@ def enhance(
         ),
     ] = False,
 ) -> None:
-    """Enhance and downscale a video for Instagram/TikTok upload."""
+    """Enhance, restore, or upscale a video for social or master delivery."""
     if preset not in PRESETS:
         raise typer.BadParameter(
             f"Unknown preset '{preset}'. Choose from: {', '.join(sorted(PRESETS))}"
@@ -213,16 +264,23 @@ def enhance(
         max_short_edge=effective_edge,
         temporal_denoise=temporal_denoise,
         ai_strength=ai_strength,
+        keep_color=keep_color,
+        recover_details=recover_details,
+        dehalo=dehalo,
+        temporal_consistency=temporal_consistency,
+        scene_change_threshold=scene_change_threshold,
         sharpen=sharpen,
         clarity=clarity,
         deband=deband,
         grain=grain,
         hdr_to_sdr=hdr_to_sdr,
+        pipe_bit_depth=pipe_bit_depth,
         maxrate_kbps=maxrate_kbps,
         gop_seconds=gop_seconds,
         tile_size=tile_size,
         tile_overlap=tile_overlap,
         tile_batch_size=tile_batch_size,
+        tile_blending=tile_blending,
         batch_size=batch_size,
         crf=crf,
         codec=codec,
@@ -234,7 +292,8 @@ def enhance(
         async_io=async_io,
         allow_unsafe_pickle=allow_unsafe_pickle,
     )
-    out_path = output or input_path.with_name(f"{input_path.stem}_ruby_{preset}.mp4")
+    ext = ".mov" if config.codec == "prores_ks" else ".mp4"
+    out_path = output or input_path.with_name(f"{input_path.stem}_ruby_{preset}{ext}")
 
     result = enhance_video(
         input_path,
@@ -247,8 +306,9 @@ def enhance(
         f"[green]Done:[/green] {result.output_path} "
         f"({result.target_width}x{result.target_height}, "
         f"{result.frames_processed} frames in {result.elapsed_sec:.2f}s @ {result.fps:.2f} fps | "
-        f"codec={result.codec_used}, tile={_format_tile_label(result.effective_tile_size)}, "
-        f"batch={result.batch_size})"
+        f"codec={result.codec_used}, {result.pipe_bit_depth}-bit, "
+        f"tile={_format_tile_label(result.effective_tile_size)}, "
+        f"tile_batch={result.effective_tile_batch_size}, batch={result.batch_size})"
     )
 
 
@@ -276,7 +336,7 @@ def benchmark(
     ] = None,
     codec: Annotated[
         str | None,
-        typer.Option("--codec", help="H.264 encoder override (auto, libx264, h264_nvenc)."),
+        typer.Option("--codec", help="Encoder override (auto, libx264, h264_nvenc, etc.)."),
     ] = None,
     nvenc_preset: Annotated[
         str | None,
@@ -301,6 +361,10 @@ def benchmark(
         int | None,
         typer.Option("--tile-batch-size", help="Tiles evaluated together per GPU pass."),
     ] = None,
+    tile_blending: Annotated[
+        str | None,
+        typer.Option("--tile-blending", help="Tile blending strategy: gaussian, cosine, linear."),
+    ] = None,
     batch_size: Annotated[
         int | None,
         typer.Option("--batch-size", help="Frames processed per GPU batch."),
@@ -312,6 +376,26 @@ def benchmark(
     ai_strength: Annotated[
         float | None,
         typer.Option("--ai-strength", help="AI blend weight override (0.0-1.0)."),
+    ] = None,
+    keep_color: Annotated[
+        bool | None,
+        typer.Option("--keep-color/--no-keep-color", help="Toggle WaveletFix color lock."),
+    ] = None,
+    recover_details: Annotated[
+        float | None,
+        typer.Option("--recover-details", help="Detail recovery strength (0.0-1.0)."),
+    ] = None,
+    dehalo: Annotated[
+        float | None,
+        typer.Option("--dehalo", help="Dehalo suppression strength (0.0-1.0)."),
+    ] = None,
+    temporal_consistency: Annotated[
+        float | None,
+        typer.Option("--temporal-consistency", help="Temporal stabilization strength (0.0-1.0)."),
+    ] = None,
+    scene_change_threshold: Annotated[
+        float | None,
+        typer.Option("--scene-change-threshold", help="Scene-cut gate threshold (0.05-0.80)."),
     ] = None,
     sharpen: Annotated[
         float | None,
@@ -332,6 +416,10 @@ def benchmark(
     hdr_to_sdr: Annotated[
         bool | None,
         typer.Option("--hdr-to-sdr/--no-hdr-to-sdr", help="Toggle HDR->SDR tonemapping."),
+    ] = None,
+    pipe_bit_depth: Annotated[
+        int | None,
+        typer.Option("--pipe-bit-depth", help="Frame pipe bit depth: 8 or 16."),
     ] = None,
     maxrate_kbps: Annotated[
         int | None,
@@ -404,14 +492,21 @@ def benchmark(
         tile_size=tile_size,
         tile_overlap=tile_overlap,
         tile_batch_size=tile_batch_size,
+        tile_blending=tile_blending,
         batch_size=batch_size,
         temporal_denoise=temporal_denoise,
         ai_strength=ai_strength,
+        keep_color=keep_color,
+        recover_details=recover_details,
+        dehalo=dehalo,
+        temporal_consistency=temporal_consistency,
+        scene_change_threshold=scene_change_threshold,
         sharpen=sharpen,
         clarity=clarity,
         deband=deband,
         grain=grain,
         hdr_to_sdr=hdr_to_sdr,
+        pipe_bit_depth=pipe_bit_depth,
         maxrate_kbps=maxrate_kbps,
         gop_seconds=gop_seconds,
         crf=crf,
@@ -445,14 +540,14 @@ def benchmark(
         f"{res.target_width}x{res.target_height}, {res.frames_processed} frames in "
         f"{res.elapsed_sec:.2f}s @ [bold]{res.fps:.2f} fps[/bold] "
         f"[{res.device_label}, tile={_format_tile_label(res.effective_tile_size)}, "
-        f"batch={res.batch_size}]"
+        f"tile_batch={res.effective_tile_batch_size}, batch={res.batch_size}]"
     )
 
 
 @app.command()
 def models() -> None:
-    """List built-in verified 1x restoration models and their licenses."""
-    table = Table(title="Built-in 1x Restoration Models")
+    """List built-in verified 1x & 2x restoration/upscaling models and their licenses."""
+    table = Table(title="Built-in Restoration & Upscaling Models")
     table.add_column("Key", style="cyan")
     table.add_column("Architecture")
     table.add_column("Scale")
@@ -477,7 +572,7 @@ def models() -> None:
 
 @app.command()
 def doctor() -> None:
-    """Inspect Python, PyTorch GPU backend, Spandrel, and FFmpeg availability."""
+    """Inspect Python, PyTorch GPU backend, free VRAM, Spandrel, and FFmpeg encoders."""
     table = Table(title=f"ruby.ai v{__version__} Environment Check")
     table.add_column("Component", style="cyan")
     table.add_column("Status")
@@ -490,16 +585,27 @@ def doctor() -> None:
     try:
         dev = select_device("auto")
         prec = "fp16 default" if dev.default_fp16 else "fp32 default"
+        mem_info = query_cuda_memory_info(dev)
         vram_suffix = (
             f", {dev.total_memory_bytes / (1024**3):.2f} GiB VRAM"
             if dev.total_memory_bytes is not None
             else ""
         )
+        if mem_info is not None:
+            vram_suffix += f" ({mem_info[0] / (1024**3):.2f} GiB free)"
         table.add_row("Selected Compute", f"{dev.backend} — {dev.name} ({prec}{vram_suffix})")
     except Exception as exc:
         table.add_row("Selected Compute", f"[red]{exc}[/red]")
 
-    table.add_row("CUDA Available", str(torch.cuda.is_available()))
+    cuda_avail = bool(torch.cuda.is_available())
+    table.add_row("CUDA Available", str(cuda_avail))
+    nv_hw = detect_nvidia_gpu_hardware()
+    if nv_hw is not None:
+        hw_label = f"{nv_hw['name']} (Driver {nv_hw['driver_version']})"
+        if not cuda_avail:
+            hw_label = f"[yellow]{hw_label} — CUDA inactive, update NVIDIA driver![/yellow]"
+        table.add_row("NVIDIA Hardware", hw_label)
+
     mps_backend = getattr(torch.backends, "mps", None)
     table.add_row("Apple MPS Available", str(bool(mps_backend and mps_backend.is_available())))
 
@@ -510,9 +616,17 @@ def doctor() -> None:
             table.add_row(binary, f"[red]{exc}[/red]")
 
     try:
-        encoders = available_h264_encoders()
-        table.add_row("H.264 Encoders", ", ".join(encoders) if encoders else "none detected")
+        encoders = available_video_encoders()
+        table.add_row("Video Encoders", ", ".join(encoders) if encoders else "none detected")
+        if "h264_nvenc" in encoders:
+            nvenc_ok, nvenc_err = probe_encoder_usable("h264_nvenc")
+            nvenc_status = (
+                "[green]usable[/green]"
+                if nvenc_ok
+                else f"[yellow]failed runtime probe ({nvenc_err})[/yellow]"
+            )
+            table.add_row("NVENC Runtime", nvenc_status)
     except Exception as exc:
-        table.add_row("H.264 Encoders", f"[red]{exc}[/red]")
+        table.add_row("Video Encoders", f"[red]{exc}[/red]")
 
     console.print(table)

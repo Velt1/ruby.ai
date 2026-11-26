@@ -1,4 +1,4 @@
-"""End-to-end 5-stage video restoration and benchmarking pipelines."""
+"""End-to-end streaming video restoration, upscaling, and benchmarking pipelines."""
 
 from __future__ import annotations
 
@@ -22,9 +22,10 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
-from ruby_ai.config import EnhanceConfig, resolve_target_dimensions
+from ruby_ai.config import EnhanceConfig, _round_even, resolve_target_dimensions
 from ruby_ai.device import select_device
 from ruby_ai.ffmpeg import (
+    ManagedProcess,
     encode_baseline_lanczos,
     extract_comparison_frame,
     open_decode_pipe,
@@ -34,9 +35,10 @@ from ruby_ai.ffmpeg import (
     resolve_hwaccel,
     simulate_social_compression,
 )
-from ruby_ai.models import Restorer
+from ruby_ai.models import Restorer, get_model_spec_scale
 
 ProgressCallback = Callable[[int, int | None], None]
+StatusCallback = Callable[[str, str, str | None], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +57,10 @@ class EnhanceResult:
     codec_used: str = ""
     effective_tile_size: int | None = None
     batch_size: int = 1
+    effective_tile_batch_size: int = 1
+    pipe_bit_depth: int = 8
+    model_scale: int = 1
+    hwaccel_used: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +91,17 @@ def _read_exact_into(stream: BinaryIO, size: int) -> bytearray | None:
     return buf
 
 
+def _buffer_to_frame(
+    buf: bytearray,
+    *,
+    width: int,
+    height: int,
+    bit_depth: int,
+) -> np.ndarray:
+    dtype = np.dtype("<u2") if bit_depth == 16 else np.uint8
+    return np.frombuffer(buf, dtype=dtype).reshape((height, width, 3))
+
+
 def _flush_batch(
     batch_items: list[np.ndarray | bytearray],
     restorer: Restorer | None,
@@ -101,16 +118,33 @@ def _flush_batch(
         tile_size=config.tile_size,
         tile_overlap=config.tile_overlap,
         tile_batch_size=config.tile_batch_size,
+        tile_blending=config.tile_blending,
+        keep_color=config.keep_color,
+        recover_details=config.recover_details,
+        dehalo=config.dehalo,
+        temporal_consistency=config.temporal_consistency,
+        scene_change_threshold=config.scene_change_threshold,
     )
     return list(restored)
 
 
+def _write_frame_safe(encode_proc: ManagedProcess, frame: np.ndarray | bytearray) -> None:
+    assert encode_proc.proc.stdin is not None
+    try:
+        encode_proc.proc.stdin.write(memoryview(frame).cast("B"))
+    except (BrokenPipeError, OSError) as exc:
+        detail = encode_proc.tail_stderr()
+        raise RuntimeError(
+            f"FFmpeg encode pipe closed unexpectedly: {detail or exc}"
+        ) from exc
+
+
 def _run_sync_loop(
     decode_stdout: BinaryIO,
-    encode_stdin: BinaryIO,
+    encode_proc: ManagedProcess,
     frame_bytes: int,
-    target_w: int,
-    target_h: int,
+    decode_w: int,
+    decode_h: int,
     restorer: Restorer | None,
     config: EnhanceConfig,
     total_frames: int | None,
@@ -125,7 +159,7 @@ def _run_sync_loop(
         nonlocal frames_processed
         processed = _flush_batch(items, restorer, config)
         for frame in processed:
-            encode_stdin.write(memoryview(frame))
+            _write_frame_safe(encode_proc, frame)
         count = len(processed)
         frames_processed += count
         progress.update(task_id, advance=count)
@@ -137,7 +171,9 @@ def _run_sync_loop(
         if buf is None:
             break
         item: np.ndarray | bytearray = (
-            np.frombuffer(buf, dtype=np.uint8).reshape((target_h, target_w, 3))
+            _buffer_to_frame(
+                buf, width=decode_w, height=decode_h, bit_depth=config.pipe_bit_depth
+            )
             if restorer is not None
             else buf
         )
@@ -155,10 +191,10 @@ def _run_sync_loop(
 
 def _run_async_loop(
     decode_stdout: BinaryIO,
-    encode_stdin: BinaryIO,
+    encode_proc: ManagedProcess,
     frame_bytes: int,
-    target_w: int,
-    target_h: int,
+    decode_w: int,
+    decode_h: int,
     restorer: Restorer | None,
     config: EnhanceConfig,
     total_frames: int | None,
@@ -193,6 +229,9 @@ def _run_async_loop(
                 return q.get(timeout=0.05)
             except queue.Empty:
                 continue
+        with err_lock:
+            if worker_errors:
+                raise worker_errors[0]
         raise RuntimeError("Pipeline aborted due to worker error")
 
     def decode_worker() -> None:
@@ -202,7 +241,9 @@ def _run_async_loop(
                 if buf is None:
                     break
                 item: np.ndarray | bytearray = (
-                    np.frombuffer(buf, dtype=np.uint8).reshape((target_h, target_w, 3))
+                    _buffer_to_frame(
+                        buf, width=decode_w, height=decode_h, bit_depth=config.pipe_bit_depth
+                    )
                     if restorer is not None
                     else buf
                 )
@@ -220,7 +261,7 @@ def _run_async_loop(
                 item = get_item(encode_queue)
                 if item is None:
                     break
-                encode_stdin.write(memoryview(item))
+                _write_frame_safe(encode_proc, item)
         except BaseException as exc:
             if not stop_event.is_set():
                 record_error(exc)
@@ -238,7 +279,15 @@ def _run_async_loop(
         processed = _flush_batch(items, restorer, config)
         for frame in processed:
             if not put_item(encode_queue, frame):
-                raise RuntimeError("Encoder worker stopped unexpectedly")
+                with err_lock:
+                    if worker_errors:
+                        raise worker_errors[0]
+                detail = encode_proc.tail_stderr()
+                raise RuntimeError(
+                    f"Encoder worker stopped unexpectedly: {detail}"
+                    if detail
+                    else "Encoder worker stopped unexpectedly"
+                )
         count = len(processed)
         frames_processed += count
         progress.update(task_id, advance=count)
@@ -276,6 +325,14 @@ def _run_async_loop(
     return frames_processed
 
 
+def _software_fallback_for(codec: str) -> str | None:
+    if codec == "h264_nvenc" or codec == "h264_videotoolbox":
+        return "libx264"
+    if codec == "hevc_nvenc":
+        return "libx265"
+    return None
+
+
 def enhance_video(
     input_path: Path,
     output_path: Path,
@@ -285,19 +342,20 @@ def enhance_video(
     duration_sec: float | None = None,
     show_progress: bool = True,
     on_progress: ProgressCallback | None = None,
+    on_status: StatusCallback | None = None,
 ) -> EnhanceResult:
-    """Run temporal pre-denoise, supersampling, 1x neural restoration, and social encoding."""
+    """Run temporal pre-denoise, supersampling/upscaling, neural restoration, and encoding."""
+    if on_status is not None:
+        on_status("probe", "Prüfe Video-Metadaten…", input_path.name)
     info = probe_video(input_path)
-    target_w, target_h = resolve_target_dimensions(
-        info.display_width,
-        info.display_height,
-        config.max_short_edge,
-    )
 
+    model_scale = get_model_spec_scale(config.model)
     restorer: Restorer | None = None
     device_backend: str | None = None
     device_label = "ffmpeg-only (passthrough)"
-    if config.ai_strength > 0.0:
+    need_neural = config.ai_strength > 0.0 or model_scale > 1
+
+    if need_neural:
         device_info = select_device(config.device)
         device_backend = device_info.backend
         restorer = Restorer(
@@ -307,7 +365,9 @@ def enhance_video(
             optimize_gpu=config.optimize_gpu,
             compile_model=config.compile_model,
             allow_unsafe_pickle=config.allow_unsafe_pickle,
+            on_status=on_status,
         )
+        model_scale = restorer.scale
         if restorer.dtype == torch.float16:
             precision = "fp16"
         elif restorer.dtype == torch.bfloat16:
@@ -317,6 +377,24 @@ def enhance_video(
         device_label = f"{device_info.name} ({precision})"
     elif config.codec == "auto" or config.hwaccel == "auto":
         device_backend = select_device(config.device).backend
+
+    allow_upscale = model_scale > 1
+    target_w, target_h = resolve_target_dimensions(
+        info.display_width,
+        info.display_height,
+        config.max_short_edge,
+        allow_upscale=allow_upscale,
+        model_scale=model_scale,
+    )
+
+    if model_scale > 1:
+        decode_w = min(info.display_width, _round_even(target_w / model_scale))
+        decode_h = min(info.display_height, _round_even(target_h / model_scale))
+    else:
+        decode_w, decode_h = target_w, target_h
+
+    net_out_w = decode_w * model_scale
+    net_out_h = decode_h * model_scale
 
     resolved_codec = resolve_codec(config.codec, device_backend=device_backend)
     resolved_hwaccel = resolve_hwaccel(config.hwaccel, device_backend=device_backend)
@@ -328,68 +406,132 @@ def enhance_video(
     else:
         total_frames = None
 
-    frame_bytes = target_w * target_h * 3
-    decode_proc = open_decode_pipe(
-        info,
-        config,
-        target_w,
-        target_h,
-        start_sec=start_sec,
-        duration_sec=duration_sec,
-        hwaccel=resolved_hwaccel,
-    )
-    encode_proc = open_encode_pipe(
-        info,
-        output_path,
-        config,
-        target_w,
-        target_h,
-        start_sec=start_sec,
-        duration_sec=duration_sec,
-        resolved_codec=resolved_codec,
-    )
+    bytes_per_channel = 2 if config.pipe_bit_depth == 16 else 1
+    frame_bytes = decode_w * decode_h * 3 * bytes_per_channel
+
+    def _execute_pipes(active_codec: str, active_hwaccel: str | None) -> int:
+        if restorer is not None:
+            restorer.reset_temporal()
+
+        decode_proc = open_decode_pipe(
+            info,
+            config,
+            decode_w,
+            decode_h,
+            start_sec=start_sec,
+            duration_sec=duration_sec,
+            hwaccel=active_hwaccel,
+        )
+        encode_proc = open_encode_pipe(
+            info,
+            output_path,
+            config,
+            target_w,
+            target_h,
+            input_w=net_out_w,
+            input_h=net_out_h,
+            start_sec=start_sec,
+            duration_sec=duration_sec,
+            resolved_codec=active_codec,
+        )
+
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            disable=not show_progress,
+        )
+
+        try:
+            assert decode_proc.proc.stdout is not None
+            assert encode_proc.proc.stdin is not None
+            with progress:
+                task_id = progress.add_task(
+                    f"Processing {target_w}x{target_h} [{device_label} | {active_codec}]",
+                    total=total_frames,
+                )
+                loop_fn = _run_async_loop if config.async_io else _run_sync_loop
+                count = loop_fn(
+                    decode_proc.proc.stdout,
+                    encode_proc,
+                    frame_bytes,
+                    decode_w,
+                    decode_h,
+                    restorer,
+                    config,
+                    total_frames,
+                    progress,
+                    task_id,
+                    on_progress,
+                )
+
+            encode_proc.close_stdin()
+            decode_proc.wait_and_check("FFmpeg decode")
+            encode_proc.wait_and_check("FFmpeg encode")
+            return count
+        except Exception:
+            decode_proc.terminate()
+            encode_proc.terminate()
+            raise
+
+    if on_status is not None:
+        on_status(
+            "enhance",
+            (
+                f"Verarbeite Video ({target_w}×{target_h}, "
+                f"{config.pipe_bit_depth}-Bit, {resolved_codec})…"
+            ),
+            device_label,
+        )
 
     started = time.perf_counter()
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[bold]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        disable=not show_progress,
-    )
+    active_codec = resolved_codec
+    active_hwaccel = resolved_hwaccel
 
-    try:
-        assert decode_proc.proc.stdout is not None
-        assert encode_proc.proc.stdin is not None
-        with progress:
-            task_id = progress.add_task(
-                f"Processing {target_w}x{target_h} [{device_label} | {resolved_codec}]",
-                total=total_frames,
-            )
-            loop_fn = _run_async_loop if config.async_io else _run_sync_loop
-            frames_processed = loop_fn(
-                decode_proc.proc.stdout,
-                encode_proc.proc.stdin,
-                frame_bytes,
-                target_w,
-                target_h,
-                restorer,
-                config,
-                total_frames,
-                progress,
-                task_id,
-                on_progress,
-            )
+    for attempt in range(3):
+        try:
+            frames_processed = _execute_pipes(active_codec, active_hwaccel)
+            break
+        except Exception as exc:
+            msg = str(exc)
+            # Retry on CPU decode if auto CUDA decode fails on 10-bit/4:2:2/ProRes sources.
+            if (
+                attempt < 2
+                and active_hwaccel == "cuda"
+                and config.hwaccel == "auto"
+                and "FFmpeg decode" in msg
+            ):
+                active_hwaccel = None
+                if on_status is not None:
+                    on_status(
+                        "fallback",
+                        (
+                            "CUDA-Hardware-Decode nicht unterstützt – "
+                            "wechsle automatisch zu CPU-Decode…"
+                        ),
+                        None,
+                    )
+                continue
 
-        encode_proc.close_stdin()
-        decode_proc.wait_and_check("FFmpeg decode")
-        encode_proc.wait_and_check("FFmpeg encode")
-    except Exception:
-        decode_proc.terminate()
-        encode_proc.terminate()
-        raise
+            sw_fallback = _software_fallback_for(active_codec)
+            if (
+                attempt < 2
+                and sw_fallback is not None
+                and config.codec == "auto"
+                and ("FFmpeg encode" in msg or "encode pipe" in msg.lower())
+            ):
+                active_codec = sw_fallback
+                if on_status is not None:
+                    on_status(
+                        "fallback",
+                        f"Hardware-Encoder fehlgeschlagen – wechsle zu '{active_codec}'…",
+                        None,
+                    )
+                continue
+            raise
 
     if frames_processed == 0:
         raise RuntimeError(f"No frames were decoded from '{input_path}'")
@@ -405,9 +547,15 @@ def enhance_video(
         target_width=target_w,
         target_height=target_h,
         model_key=config.model,
-        codec_used=resolved_codec,
+        codec_used=active_codec,
         effective_tile_size=restorer.last_tile_size if restorer is not None else None,
         batch_size=config.batch_size,
+        effective_tile_batch_size=(
+            restorer.last_tile_batch_size if restorer is not None else 1
+        ),
+        pipe_bit_depth=config.pipe_bit_depth,
+        model_scale=model_scale,
+        hwaccel_used=active_hwaccel,
     )
 
 
@@ -422,14 +570,19 @@ def run_benchmark_detailed(
     reference_path: Path | None = None,
     show_progress: bool = True,
     on_progress: ProgressCallback | None = None,
+    on_status: StatusCallback | None = None,
+    fast_baseline: bool = False,
 ) -> BenchmarkReport:
     """Generate baseline Lanczos, ruby.ai, and simulated social-compressed comparisons."""
     output_dir.mkdir(parents=True, exist_ok=True)
     info = probe_video(input_path)
+    model_scale = get_model_spec_scale(config.model) if config.ai_strength > 0.0 else 1
     target_w, target_h = resolve_target_dimensions(
         info.display_width,
         info.display_height,
         config.max_short_edge,
+        allow_upscale=model_scale > 1,
+        model_scale=model_scale,
     )
 
     baseline_path = output_dir / "baseline_lanczos.mp4"
@@ -437,6 +590,8 @@ def run_benchmark_detailed(
     baseline_social_path = output_dir / "baseline_lanczos_social.mp4"
     enhanced_social_path = output_dir / "ruby_enhanced_social.mp4"
 
+    if on_status is not None:
+        on_status("baseline", "Erstelle Lanczos-Vergleichsclip…", f"{target_w}×{target_h}")
     encode_baseline_lanczos(
         input_path,
         baseline_path,
@@ -445,7 +600,12 @@ def run_benchmark_detailed(
         start_sec=start_sec,
         duration_sec=duration_sec,
         crf=config.crf,
+        fast_preview=fast_baseline,
+        hdr_to_sdr=config.hdr_to_sdr,
+        is_hdr=info.is_hdr,
+        color_transfer=info.color_transfer,
     )
+
     enhance_result = enhance_video(
         input_path,
         enhanced_path,
@@ -454,8 +614,15 @@ def run_benchmark_detailed(
         duration_sec=duration_sec,
         show_progress=show_progress,
         on_progress=on_progress,
+        on_status=on_status,
     )
 
+    if on_status is not None:
+        on_status(
+            "social_sim",
+            f"Simuliere Instagram/TikTok-Kompression ({bitrate_kbps} kbps)…",
+            None,
+        )
     simulate_social_compression(baseline_path, baseline_social_path, bitrate_kbps=bitrate_kbps)
     simulate_social_compression(enhanced_path, enhanced_social_path, bitrate_kbps=bitrate_kbps)
 

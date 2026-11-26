@@ -51,11 +51,19 @@ export function PreviewStage({
 }: PreviewStageProps) {
   const [resultTab, setResultTab] = useState("compare");
   const [compareSource, setCompareSource] = useState<"social" | "master">("social");
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
     if (activeJob?.status === "completed") {
       setResultTab("compare");
     }
+  }, [activeJob?.job_id, activeJob?.status]);
+
+  useEffect(() => {
+    if (activeJob?.status !== "running") return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 500);
+    return () => window.clearInterval(id);
   }, [activeJob?.job_id, activeJob?.status]);
 
   if (probing) {
@@ -64,7 +72,7 @@ export function PreviewStage({
         <Loader2 className="h-8 w-8 animate-spin text-primary" />
         <p className="mt-3 text-sm font-medium">Video wird analysiert…</p>
         <p className="mt-1 text-xs text-muted-foreground">
-          Auflösung, Farbraum, Helligkeit und optimale Social-Einstellungen werden ermittelt.
+          Auflösung, Farbraum, Schärfe, Rauschen und optimale Einstellungen werden ermittelt.
         </p>
       </div>
     );
@@ -155,7 +163,14 @@ export function PreviewStage({
     (analysis !== null &&
       (analysis.recommended_preset !== currentPreset ||
         analysis.is_hdr ||
-        analysis.is_high_fps));
+        analysis.is_high_fps ||
+        analysis.is_low_light ||
+        analysis.is_heavily_compressed));
+
+  const liveElapsedSec =
+    activeJob?.status === "running"
+      ? Math.max(activeJob.elapsed_sec, (nowMs - activeJob.started_at_ms) / 1000)
+      : activeJob?.elapsed_sec ?? 0;
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-2.5">
@@ -170,6 +185,11 @@ export function PreviewStage({
             {probe.display_width}×{probe.display_height} · {probe.codec_name.toUpperCase()} ·{" "}
             {probe.fps} fps
           </Badge>
+          {probe.bit_depth && probe.bit_depth >= 10 && (
+            <Badge variant="outline" className="text-[10px] tabular-nums">
+              {probe.bit_depth}-Bit
+            </Badge>
+          )}
           {probe.is_hdr && (
             <Badge variant="warning" className="text-[10px]">
               HDR → BT.709
@@ -177,7 +197,7 @@ export function PreviewStage({
           )}
           <ArrowRight className="h-3.5 w-3.5 text-muted-foreground" />
           <Badge variant="outline" className="tabular-nums text-[11px] font-normal">
-            {probe.target_width}×{probe.target_height} H.264
+            {probe.target_width}×{probe.target_height}
           </Badge>
           <span className="text-[11px] text-muted-foreground tabular-nums">
             {formatDuration(probe.duration)} · {formatBytes(probe.file_size_bytes)} ·{" "}
@@ -203,7 +223,7 @@ export function PreviewStage({
           {analyzing ? (
             <div className="flex items-center gap-2 text-muted-foreground">
               <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
-              <span>Auto-Analyse prüft Helligkeit & Kompressionsdichte…</span>
+              <span>Auto-Analyse prüft Schärfe, Rauschen & Kompressionsdichte…</span>
             </div>
           ) : analysis ? (
             <>
@@ -222,6 +242,16 @@ export function PreviewStage({
                 {analysis.is_high_fps && (
                   <Badge variant="secondary" className="text-[10px]">
                     High-FPS
+                  </Badge>
+                )}
+                {typeof analysis.noise_score === "number" && (
+                  <Badge variant="outline" className="text-[10px] tabular-nums">
+                    Rauschen {Math.round(analysis.noise_score * 100)}%
+                  </Badge>
+                )}
+                {typeof analysis.sharpness_score === "number" && (
+                  <Badge variant="outline" className="text-[10px] tabular-nums">
+                    Schärfe {Math.round(analysis.sharpness_score * 100)}%
                   </Badge>
                 )}
                 <span className="text-muted-foreground truncate">
@@ -256,23 +286,33 @@ export function PreviewStage({
       {activeJob?.status === "running" && (
         <div className="shrink-0 rounded-lg border border-primary/30 bg-card/80 p-3">
           <div className="flex items-center justify-between gap-3">
-            <div className="flex items-center gap-2 text-xs">
-              <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
-              <span className="font-medium">
-                {activeJob.mode === "preview"
-                  ? "2s Social-Vorschau"
-                  : activeJob.mode === "benchmark"
-                    ? "Benchmark A/B"
-                    : "Video-Export"}{" "}
-                läuft:{" "}
-                <span className="text-muted-foreground">{activeJob.preset}</span>
-              </span>
+            <div className="min-w-0 flex-1 space-y-0.5">
+              <div className="flex items-center gap-2 text-xs">
+                <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" />
+                <span className="font-medium truncate">
+                  {activeJob.frames_done === 0 && activeJob.status_message
+                    ? activeJob.status_message
+                    : activeJob.mode === "preview"
+                      ? "2s Social-Vorschau"
+                      : activeJob.mode === "benchmark"
+                        ? "Benchmark A/B"
+                        : "Video-Export"}
+                  {activeJob.frames_done > 0 && (
+                    <span className="text-muted-foreground"> · {activeJob.preset}</span>
+                  )}
+                </span>
+              </div>
+              {activeJob.status_detail && (
+                <p className="truncate pl-5 text-[11px] text-muted-foreground">
+                  {activeJob.status_detail}
+                </p>
+              )}
             </div>
-            <div className="flex items-center gap-3">
+            <div className="flex shrink-0 items-center gap-3">
               <span className="text-xs text-muted-foreground tabular-nums">
                 {activeJob.frames_done}
                 {activeJob.total_frames ? ` / ${activeJob.total_frames}` : ""} Frames ·{" "}
-                {activeJob.fps.toFixed(2)} fps · {activeJob.elapsed_sec.toFixed(1)}s
+                {activeJob.fps.toFixed(2)} fps · {liveElapsedSec.toFixed(1)}s
                 {activeJob.eta_sec != null ? ` · ETA ${activeJob.eta_sec.toFixed(0)}s` : ""}
               </span>
               <Button
@@ -317,7 +357,7 @@ export function PreviewStage({
                   )}
                   {enhancedVideoUrl && (
                     <TabsTrigger value="enhanced" className="text-xs px-3">
-                      {benchRes ? "Vorschau Master MP4" : "Export MP4"}
+                      {benchRes ? "Vorschau Master MP4" : "Export"}
                     </TabsTrigger>
                   )}
                   {enhancedSocialUrl && (
@@ -498,14 +538,18 @@ export function PreviewStage({
                       {core.elapsed_sec.toFixed(2)}s ({core.frames_processed} Frames)
                     </span>
                     <span>
-                      <span className="text-muted-foreground">Profil/Modell:</span> {core.model_key}
+                      <span className="text-muted-foreground">Modell:</span> {core.model_key}
                     </span>
                     <span>
                       <span className="text-muted-foreground">Codec:</span> {core.codec_used}
                     </span>
                     <span>
-                      <span className="text-muted-foreground">Tiling:</span> {tileLabel} · Batch{" "}
-                      {core.batch_size}
+                      <span className="text-muted-foreground">Pipe:</span>{" "}
+                      {core.pipe_bit_depth ?? 8}-Bit
+                    </span>
+                    <span>
+                      <span className="text-muted-foreground">Tiling:</span> {tileLabel} (TB{" "}
+                      {core.effective_tile_batch_size ?? 1}) · Batch {core.batch_size}
                     </span>
                   </div>
                   <div className="flex items-center gap-3 tabular-nums text-muted-foreground">

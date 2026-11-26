@@ -387,7 +387,9 @@ impl RuntimeManager {
         }
 
         let client = reqwest::Client::builder()
-            .user_agent("ruby-ai-desktop-setup/0.1")
+            .user_agent("ruby-ai-desktop-setup/0.2")
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .read_timeout(std::time::Duration::from_secs(120))
             .build()
             .map_err(|err| format!("HTTP-Client-Fehler: {err}"))?;
 
@@ -575,6 +577,12 @@ impl RuntimeManager {
                 .map(|s| s.accelerator != accelerator || s.deps_hash != manifest.deps_hash)
                 .unwrap_or(true);
 
+        let index_url = match accelerator.as_str() {
+            "cuda" => manifest.torch_indexes.cuda.as_deref(),
+            "mps" => manifest.torch_indexes.mps.as_deref(),
+            _ => manifest.torch_indexes.cpu.as_deref(),
+        };
+
         if torch_needs_install && !manifest.torch_dependencies.is_empty() {
             let accel_label = match accelerator.as_str() {
                 "cuda" => "PyTorch GPU (CUDA 12.6)",
@@ -596,11 +604,6 @@ impl RuntimeManager {
                 "--python".to_string(),
                 venv_py.display().to_string(),
             ];
-            let index_url = match accelerator.as_str() {
-                "cuda" => manifest.torch_indexes.cuda.as_deref(),
-                "mps" => manifest.torch_indexes.mps.as_deref(),
-                _ => manifest.torch_indexes.cpu.as_deref(),
-            };
             if let Some(url) = index_url {
                 args.push("--index-url".to_string());
                 args.push(url.to_string());
@@ -651,6 +654,14 @@ impl RuntimeManager {
                 "--python".to_string(),
                 venv_py.display().to_string(),
             ];
+            if let Some(url) = index_url {
+                args.push("--index-url".to_string());
+                args.push(url.to_string());
+                args.push("--extra-index-url".to_string());
+                args.push("https://pypi.org/simple".to_string());
+                args.push("--index-strategy".to_string());
+                args.push("first-index".to_string());
+            }
             args.extend(manifest.base_dependencies.clone());
 
             run_uv_command(

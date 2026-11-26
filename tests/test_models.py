@@ -22,7 +22,7 @@ from ruby_ai.models import (
 )
 
 
-def test_registry_uses_safetensors_and_1x_verified_licenses() -> None:
+def test_registry_uses_safetensors_and_verified_licenses() -> None:
     expected_keys = {
         "de-h264",
         "denoise",
@@ -31,15 +31,16 @@ def test_registry_uses_safetensors_and_1x_verified_licenses() -> None:
         "superscale-fast",
         "de-jpg-fast",
         "exposure-compact",
+        "upscale-2x-span",
     }
     assert expected_keys.issubset(set(MODEL_REGISTRY.keys()))
 
     for spec in MODEL_REGISTRY.values():
-        assert spec.scale == 1
+        assert spec.scale in {1, 2, 4}
         assert spec.filename.endswith(".safetensors")
         assert spec.license in ALLOWED_MODEL_LICENSES
 
-    for core_key in ("de-h264", "denoise", "de-jpg"):
+    for core_key in ("de-h264", "denoise", "de-jpg", "upscale-2x-span"):
         assert MODEL_REGISTRY[core_key].license == "CC-BY-4.0"
         assert MODEL_REGISTRY[core_key].commercial_use is True
 

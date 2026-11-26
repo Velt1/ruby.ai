@@ -18,9 +18,7 @@ from typing import Any, TextIO, cast
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
-import spandrel
-import torch
-
+# Keep module-level imports free of PyTorch/Spandrel so `probe` & `analyze` stay instant.
 from ruby_ai import __version__
 from ruby_ai.analyzer import analyze_video
 from ruby_ai.config import (
@@ -28,6 +26,8 @@ from ruby_ai.config import (
     ALLOWED_EXPORT_TARGETS,
     ALLOWED_HWACCELS,
     ALLOWED_NVENC_PRESETS,
+    ALLOWED_PIPE_BIT_DEPTHS,
+    ALLOWED_TILE_BLENDINGS,
     ALLOWED_X264_PRESETS,
     EXPORT_TARGETS,
     PRESETS,
@@ -36,20 +36,28 @@ from ruby_ai.config import (
     PresetName,
     resolve_target_dimensions,
 )
-from ruby_ai.device import select_device
 from ruby_ai.ffmpeg import (
-    available_h264_encoders,
+    available_video_encoders,
     encode_baseline_lanczos,
     probe_bitrate_kbps,
+    probe_encoder_usable,
     probe_video,
     require_binary,
+    subprocess_creation_flags,
 )
-from ruby_ai.models import MODEL_REGISTRY, get_model_cache_dir
-from ruby_ai.pipeline import enhance_video, run_benchmark_detailed
+
+_KNOWN_UPSCALE_SCALES: dict[str, int] = {
+    "upscale-2x-span": 2,
+}
 
 
 def _preview_cache_dir() -> Path:
-    cache_dir = get_model_cache_dir().parent / "previews"
+    env_dir = os.environ.get("RUBY_AI_CACHE_DIR")
+    if env_dir:
+        base_dir = Path(env_dir).expanduser().parent
+    else:
+        base_dir = Path.home() / ".cache" / "ruby-ai"
+    cache_dir = base_dir / "previews"
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
@@ -118,7 +126,13 @@ def _extract_single_frame(
         args.extend(["-vf", f"scale=-2:'min(ih,{max_height})':flags=lanczos"])
     args.extend(["-frames:v", "1", str(output_png)])
 
-    proc = subprocess.run(args, capture_output=True, text=True, check=False)
+    proc = subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        creationflags=subprocess_creation_flags(),
+        check=False,
+    )
     if proc.returncode != 0:
         raise RuntimeError(
             f"Poster/frame extraction failed for '{video_path}': {proc.stderr.strip()}"
@@ -156,9 +170,23 @@ def _build_enhance_config(payload: dict[str, Any]) -> tuple[PresetName, EnhanceC
 
 def _handle_info(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
     del payload
+    import spandrel
+    import torch
+
+    from ruby_ai.device import (
+        detect_nvidia_gpu_hardware,
+        query_cuda_memory_info,
+        select_device,
+    )
+    from ruby_ai.models import MODEL_REGISTRY
+
     device_payload: dict[str, Any]
+    free_memory_gb: float | None = None
     try:
         dev = select_device("auto")
+        mem_info = query_cuda_memory_info(dev)
+        if mem_info is not None:
+            free_memory_gb = round(mem_info[0] / (1024**3), 2)
         device_payload = {
             "backend": dev.backend,
             "name": dev.name,
@@ -168,6 +196,7 @@ def _handle_info(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
                 if dev.total_memory_bytes is not None
                 else None
             ),
+            "free_memory_gb": free_memory_gb,
             "error": None,
         }
     except Exception as exc:
@@ -176,16 +205,31 @@ def _handle_info(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
             "name": "Unavailable",
             "default_fp16": False,
             "total_memory_gb": None,
+            "free_memory_gb": None,
             "error": str(exc),
         }
+
+    cuda_avail = bool(torch.cuda.is_available())
+    nv_hw = detect_nvidia_gpu_hardware()
+    cuda_warning: str | None = None
+    if not cuda_avail and nv_hw is not None:
+        cuda_warning = (
+            f"NVIDIA GPU erkannt ({nv_hw['name']}, Treiber {nv_hw['driver_version']}), "
+            "aber CUDA ist in PyTorch inaktiv. Bitte NVIDIA-Treiber (>= 560) aktualisieren."
+        )
 
     mps_backend = getattr(torch.backends, "mps", None)
     ffmpeg_path = shutil.which("ffmpeg")
     ffprobe_path = shutil.which("ffprobe")
     try:
-        encoders = available_h264_encoders() if ffmpeg_path else []
+        encoders = available_video_encoders() if ffmpeg_path else []
     except Exception:
         encoders = []
+
+    nvenc_usable: bool | None = None
+    nvenc_error: str | None = None
+    if ffmpeg_path and "h264_nvenc" in encoders and (cuda_avail or nv_hw is not None):
+        nvenc_usable, nvenc_error = probe_encoder_usable("h264_nvenc")
 
     presets_payload = [{"key": key, **values} for key, values in PRESETS.items()]
     export_targets_payload = [{"key": key, **values} for key, values in EXPORT_TARGETS.items()]
@@ -213,13 +257,18 @@ def _handle_info(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
             "pytorch": torch.__version__,
             "spandrel": getattr(spandrel, "__version__", "installed"),
             "device": device_payload,
-            "cuda_available": bool(torch.cuda.is_available()),
+            "cuda_available": cuda_avail,
             "mps_available": bool(mps_backend and mps_backend.is_available()),
+            "nvidia_gpu_hardware": nv_hw["name"] if nv_hw else None,
+            "nvidia_driver_version": nv_hw["driver_version"] if nv_hw else None,
+            "cuda_warning": cuda_warning,
             "ffmpeg_available": ffmpeg_path is not None,
             "ffprobe_available": ffprobe_path is not None,
             "ffmpeg_path": ffmpeg_path,
             "ffprobe_path": ffprobe_path,
             "encoders": encoders,
+            "nvenc_usable": nvenc_usable,
+            "nvenc_error": nvenc_error,
             "presets": presets_payload,
             "profiles": PROFILE_METADATA,
             "export_targets": export_targets_payload,
@@ -230,6 +279,8 @@ def _handle_info(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
                 "nvenc_presets": sorted(ALLOWED_NVENC_PRESETS),
                 "hwaccels": sorted(ALLOWED_HWACCELS),
                 "export_targets": sorted(ALLOWED_EXPORT_TARGETS),
+                "tile_blendings": sorted(ALLOWED_TILE_BLENDINGS),
+                "pipe_bit_depths": sorted(ALLOWED_PIPE_BIT_DEPTHS),
             },
         },
     )
@@ -243,10 +294,14 @@ def _handle_probe(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
     video_path = Path(str(raw_path)).expanduser()
     info = probe_video(video_path)
     max_short_edge = int(payload.get("max_short_edge") or 1080)
+    model_key = str(payload.get("model") or "")
+    model_scale = int(payload.get("model_scale") or _KNOWN_UPSCALE_SCALES.get(model_key, 1))
     target_w, target_h = resolve_target_dimensions(
         info.display_width,
         info.display_height,
         max_short_edge,
+        allow_upscale=model_scale > 1,
+        model_scale=model_scale,
     )
     stat = video_path.stat()
     try:
@@ -287,6 +342,8 @@ def _handle_probe(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
             "frame_count": info.frame_count,
             "has_audio": info.has_audio,
             "pix_fmt": info.pix_fmt,
+            "bit_depth": info.bit_depth,
+            "is_high_bit_depth": info.is_high_bit_depth,
             "codec_name": info.codec_name,
             "color_space": info.color_space,
             "color_transfer": info.color_transfer,
@@ -314,6 +371,9 @@ def _handle_analyze(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
             "avg_luma": analysis.avg_luma,
             "avg_saturation": analysis.avg_saturation,
             "bits_per_pixel": analysis.bits_per_pixel,
+            "noise_score": analysis.noise_score,
+            "sharpness_score": analysis.sharpness_score,
+            "compression_score": analysis.compression_score,
             "is_low_light": analysis.is_low_light,
             "is_heavily_compressed": analysis.is_heavily_compressed,
             "is_hdr": analysis.is_hdr,
@@ -369,7 +429,26 @@ def _make_progress_callback(
     return _on_progress
 
 
+def _make_status_callback(
+    emitter: BridgeEmitter,
+    *,
+    job_id: str,
+) -> Callable[[str, str, str | None], None]:
+    def _on_status(stage: str, message: str, detail: str | None) -> None:
+        emitter.emit(
+            "status",
+            job_id=job_id,
+            stage=stage,
+            message=message,
+            detail=detail,
+        )
+
+    return _on_status
+
+
 def _handle_enhance(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
+    from ruby_ai.pipeline import enhance_video
+
     job_id = str(payload.get("job_id") or "job")
     raw_input = payload.get("input_path")
     if not raw_input:
@@ -377,11 +456,12 @@ def _handle_enhance(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
 
     input_path = Path(str(raw_input)).expanduser()
     preset, config = _build_enhance_config(payload)
+    ext = ".mov" if config.codec == "prores_ks" else ".mp4"
     raw_output = payload.get("output_path")
     output_path = (
         Path(str(raw_output)).expanduser()
         if raw_output
-        else input_path.with_name(f"{input_path.stem}_ruby_{preset}.mp4")
+        else input_path.with_name(f"{input_path.stem}_ruby_{preset}{ext}")
     )
     start_sec = float(payload["start_sec"]) if payload.get("start_sec") is not None else None
     duration_sec = (
@@ -398,6 +478,7 @@ def _handle_enhance(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
         model=config.model,
     )
 
+    status_cb = _make_status_callback(emitter, job_id=job_id)
     result = enhance_video(
         input_path,
         output_path,
@@ -406,52 +487,64 @@ def _handle_enhance(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
         duration_sec=duration_sec,
         show_progress=False,
         on_progress=_make_progress_callback(emitter, job_id=job_id, stage="enhance"),
+        on_status=status_cb,
     )
 
     before_png: str | None = None
     after_png: str | None = None
     before_video_path: str | None = None
     if payload.get("extract_preview_pair", True):
-        src_info = probe_video(input_path)
-        out_info = probe_video(result.output_path)
-        mid_out = max(0.05, out_info.duration * 0.5) if out_info.duration > 0 else 0.0
-        mid_in = (start_sec or 0.0) + mid_out
-        preview_dir = _preview_cache_dir() / job_id
-        before_file = preview_dir / "before_frame.png"
-        after_file = preview_dir / "after_frame.png"
-        before_video_file = preview_dir / "before_video.mp4"
-        _extract_single_frame(
-            input_path,
-            before_file,
-            timestamp_sec=mid_in,
-            max_height=None,
-            scale_w=result.target_width,
-            scale_h=result.target_height,
-        )
-        _extract_single_frame(
-            result.output_path,
-            after_file,
-            timestamp_sec=mid_out,
-            max_height=None,
-        )
-        encode_baseline_lanczos(
-            input_path,
-            before_video_file,
-            target_w=result.target_width,
-            target_h=result.target_height,
-            start_sec=start_sec,
-            duration_sec=duration_sec,
-            fast_preview=True,
-            hdr_to_sdr=config.hdr_to_sdr,
-            is_hdr=src_info.is_hdr,
-            color_transfer=src_info.color_transfer,
-        )
-        before_png = str(before_file)
-        after_png = str(after_file)
-        before_video_path = str(before_video_file)
+        status_cb("preview_pair", "Erstelle Vorher/Nachher-Vergleichsbilder…", None)
+        try:
+            src_info = probe_video(input_path)
+            out_info = probe_video(result.output_path)
+            mid_out = max(0.05, out_info.duration * 0.5) if out_info.duration > 0 else 0.0
+            mid_in = (start_sec or 0.0) + mid_out
+            preview_dir = _preview_cache_dir() / job_id
+            before_file = preview_dir / "before_frame.png"
+            after_file = preview_dir / "after_frame.png"
+            _extract_single_frame(
+                input_path,
+                before_file,
+                timestamp_sec=mid_in,
+                max_height=None,
+                scale_w=result.target_width,
+                scale_h=result.target_height,
+            )
+            _extract_single_frame(
+                result.output_path,
+                after_file,
+                timestamp_sec=mid_out,
+                max_height=None,
+            )
+            before_png = str(before_file)
+            after_png = str(after_file)
+
+            # Avoid re-encoding full-length comparison baselines on long exports (>45s).
+            if out_info.duration <= 45.0:
+                before_video_file = preview_dir / "before_video.mp4"
+                encode_baseline_lanczos(
+                    input_path,
+                    before_video_file,
+                    target_w=result.target_width,
+                    target_h=result.target_height,
+                    start_sec=start_sec,
+                    duration_sec=duration_sec,
+                    fast_preview=True,
+                    hdr_to_sdr=config.hdr_to_sdr,
+                    is_hdr=src_info.is_hdr,
+                    color_transfer=src_info.color_transfer,
+                )
+                before_video_path = str(before_video_file)
+        except Exception:
+            # Never fail an already-completed export due to optional preview extraction.
+            pass
 
     file_size_bytes = result.output_path.stat().st_size if result.output_path.is_file() else 0
-    total_kbps, video_kbps = probe_bitrate_kbps(result.output_path)
+    try:
+        total_kbps, video_kbps = probe_bitrate_kbps(result.output_path)
+    except Exception:
+        total_kbps, video_kbps = 0.0, 0.0
 
     emitter.emit(
         "completed",
@@ -468,6 +561,9 @@ def _handle_enhance(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
             "model_key": result.model_key,
             "codec_used": result.codec_used,
             "effective_tile_size": result.effective_tile_size,
+            "effective_tile_batch_size": result.effective_tile_batch_size,
+            "pipe_bit_depth": result.pipe_bit_depth,
+            "model_scale": result.model_scale,
             "batch_size": result.batch_size,
             "file_size_bytes": file_size_bytes,
             "total_bitrate_kbps": round(total_kbps, 1),
@@ -488,7 +584,10 @@ def _run_comparison_job(
     default_bitrate_kbps: int,
     default_output_dir: Path,
     default_start_sec: float | None = None,
+    fast_baseline: bool = False,
 ) -> None:
+    from ruby_ai.pipeline import run_benchmark_detailed
+
     job_id = str(payload.get("job_id") or "job")
     raw_input = payload.get("input_path")
     if not raw_input:
@@ -516,6 +615,7 @@ def _run_comparison_job(
         model=config.model,
     )
 
+    status_cb = _make_status_callback(emitter, job_id=job_id)
     report = run_benchmark_detailed(
         input_path,
         output_dir,
@@ -526,6 +626,8 @@ def _run_comparison_job(
         reference_path=reference_path,
         show_progress=False,
         on_progress=_make_progress_callback(emitter, job_id=job_id, stage=mode),
+        on_status=status_cb,
+        fast_baseline=fast_baseline,
     )
 
     compare_ts = max(0.1, duration_sec * 0.5)
@@ -580,6 +682,9 @@ def _run_comparison_job(
                 "model_key": res.model_key,
                 "codec_used": res.codec_used,
                 "effective_tile_size": res.effective_tile_size,
+                "effective_tile_batch_size": res.effective_tile_batch_size,
+                "pipe_bit_depth": res.pipe_bit_depth,
+                "model_scale": res.model_scale,
                 "batch_size": res.batch_size,
             },
         },
@@ -599,6 +704,7 @@ def _handle_benchmark(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
         default_duration=5.0,
         default_bitrate_kbps=3500,
         default_output_dir=input_path.parent / f"{input_path.stem}_ruby_benchmark_{job_id[:8]}",
+        fast_baseline=False,
     )
 
 
@@ -619,6 +725,7 @@ def _handle_preview(payload: dict[str, Any], emitter: BridgeEmitter) -> None:
         default_bitrate_kbps=3000,
         default_output_dir=_preview_cache_dir() / f"preview_{job_id[:8]}",
         default_start_sec=default_start,
+        fast_baseline=True,
     )
 
 
